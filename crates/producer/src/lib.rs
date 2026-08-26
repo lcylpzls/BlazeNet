@@ -7,9 +7,18 @@ use anyhow::{Context, Result, bail};
 use blaze_common::manifest::{FileEntry, GameIndex};
 use blaze_common::update_plan;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+
+/// 输出目录单实例锁：存在期间阻止并发制作，Drop 时释放。
+struct OutputLock(PathBuf);
+
+impl Drop for OutputLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// 程序入口：按 Windows 规范自动定位配置文件后执行。
 pub fn run() -> Result<()> {
@@ -20,6 +29,12 @@ pub fn run() -> Result<()> {
 /// 按指定配置文件执行完整制作流程。
 pub fn run_with_config(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
+    std::fs::create_dir_all(&config.output_dir)
+        .context(format!("创建输出目录失败: {}", config.output_dir.display()))?;
+    let lock_path = config.output_dir.join(".producer.lock");
+    std::fs::File::create_new(&lock_path)
+        .with_context(|| format!("已有制作实例占用输出目录: {}", lock_path.display()))?;
+    let _lock = OutputLock(lock_path);
     let files = chunker::list_files(&config.source_dir)?;
     if files.is_empty() {
         bail!("source_dir 下没有文件: {}", config.source_dir.display());
@@ -37,10 +52,16 @@ pub fn run_with_config(path: &Path) -> Result<()> {
 
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
-    for rel in &files {
+    for (idx, rel) in files.iter().enumerate() {
         let full = config.source_dir.join(rel);
         let chunks = chunker::chunk_file(&full, &config.chunk, Some(&stage_dir), &mut seen)?;
         let file_hash = chunker::file_hash(&full)?;
+        println!(
+            "分块进度 {}/{}: {}",
+            idx + 1,
+            files.len(),
+            rel.to_string_lossy()
+        );
         entries.push(FileEntry {
             name: rel.to_string_lossy().replace('\\', "/"),
             file_hash,
@@ -57,10 +78,16 @@ pub fn run_with_config(path: &Path) -> Result<()> {
             let prev_files = chunker::list_files(prev)?;
             let mut prev_entries = Vec::new();
             let mut prev_seen = HashSet::new();
-            for rel in &prev_files {
+            for (idx, rel) in prev_files.iter().enumerate() {
                 let full = prev.join(rel);
                 let chunks = chunker::chunk_file(&full, &config.chunk, None, &mut prev_seen)?;
                 let file_hash = chunker::file_hash(&full)?;
+                println!(
+                    "比对上一版本进度 {}/{}: {}",
+                    idx + 1,
+                    prev_files.len(),
+                    rel.to_string_lossy()
+                );
                 prev_entries.push(FileEntry {
                     name: rel.to_string_lossy().replace('\\', "/"),
                     file_hash,
@@ -89,6 +116,11 @@ pub fn run_with_config(path: &Path) -> Result<()> {
 
     // 配置 origin_addr 时执行上传：秒传 → 流式上传 → 提交版本
     if let Some(addr) = &config.origin_addr {
+        println!(
+            "开始上传差异块: {} 块（{:.1}MiB）",
+            plan.chunks_to_download.len(),
+            plan.download_bytes as f64 / 1024.0 / 1024.0
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -227,6 +259,25 @@ mod tests {
                 .next()
                 .is_none()
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_locked_by_another_instance() {
+        let dir = std::env::temp_dir().join("blaze-run-lock");
+        let _ = fs::remove_dir_all(&dir);
+        let previous = dir.join("previous");
+        let source = dir.join("source");
+        let output = dir.join("output");
+        fs::create_dir_all(&previous).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        write_random(&previous.join("a.bin"), 1024, 1);
+        write_random(&source.join("a.bin"), 2048, 2);
+        fs::write(output.join(".producer.lock"), b"locked").unwrap();
+        let cfg_path = write_config(&dir, &source, &previous, &output);
+        let err = run_with_config(&cfg_path).unwrap_err();
+        assert!(err.to_string().contains("已有制作实例"));
         let _ = fs::remove_dir_all(&dir);
     }
 
