@@ -13,6 +13,11 @@ pub const DEFAULT_OFFLINE_TIMEOUT_SECS: u64 = 75;
 pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 25;
 /// 连续失败默认 3 次标记不可达。
 pub const DEFAULT_KEEPALIVE_FAIL_THRESHOLD: u32 = 3;
+/// 默认前端静态资源目录。
+pub const DEFAULT_WEB_DIR: &str = "web";
+/// 默认管理员账号（生产必须修改）。
+pub const DEFAULT_ADMIN_USER: &str = "admin";
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
 
 fn default_bind() -> String {
     DEFAULT_BIND_ADDR.to_string()
@@ -34,6 +39,18 @@ fn default_keepalive_threshold() -> u32 {
     DEFAULT_KEEPALIVE_FAIL_THRESHOLD
 }
 
+fn default_web_dir() -> String {
+    DEFAULT_WEB_DIR.to_string()
+}
+
+fn default_admin_user() -> String {
+    DEFAULT_ADMIN_USER.to_string()
+}
+
+fn default_admin_password() -> String {
+    DEFAULT_ADMIN_PASSWORD.to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -47,6 +64,12 @@ pub struct Config {
     pub keepalive_interval_secs: u64,
     #[serde(default = "default_keepalive_threshold")]
     pub keepalive_fail_threshold: u32,
+    #[serde(default = "default_web_dir")]
+    pub web_dir: String,
+    #[serde(default = "default_admin_user")]
+    pub admin_user: String,
+    #[serde(default = "default_admin_password")]
+    pub admin_password: String,
 }
 
 impl Config {
@@ -90,6 +113,9 @@ impl Config {
         }
         if self.keepalive_interval_secs == 0 || self.keepalive_fail_threshold == 0 {
             bail!("保活周期与失败阈值必须大于 0");
+        }
+        if self.admin_user.is_empty() || self.admin_password.is_empty() {
+            bail!("admin_user 与 admin_password 不能为空");
         }
         Ok(())
     }
@@ -138,6 +164,9 @@ mod tests {
             config.keepalive_fail_threshold,
             DEFAULT_KEEPALIVE_FAIL_THRESHOLD
         );
+        assert_eq!(config.web_dir, DEFAULT_WEB_DIR);
+        assert_eq!(config.admin_user, DEFAULT_ADMIN_USER);
+        assert_eq!(config.admin_password, DEFAULT_ADMIN_PASSWORD);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -222,6 +251,21 @@ mod tests {
         .unwrap();
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("保活"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_empty_admin() {
+        let dir = std::env::temp_dir().join("blaze-sched-cfg-admin");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.toml");
+        fs::write(
+            &path,
+            format!("data_dir = \"{}\"\nadmin_password = \"\"\n", dir.display()),
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("admin"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
