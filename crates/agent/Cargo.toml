@@ -11,5 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
+blaze-common = { path = "../blaze-common" }
+iroh.workspace = true
+iroh-relay.workspace = true
+origin = { path = "../origin" }
 serde.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 toml.workspace = true

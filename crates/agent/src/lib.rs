@@ -1,5 +1,7 @@
 //! 节点 agent 库：IDC 节点（Linux）与网吧服务器（Windows）共用实现（M4/M5）。
 pub mod config;
+pub mod datapath;
+pub mod download;
 
 use anyhow::Result;
 

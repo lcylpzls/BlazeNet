@@ -13,6 +13,8 @@ pub const DEFAULT_CHUNK_CONCURRENCY: u32 = 4;
 pub const DEFAULT_DISK_FREE_THRESHOLD: u64 = 200 * 1024 * 1024 * 1024;
 /// 默认压缩触发阈值。
 pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.3;
+/// 默认数据面监听端口（>10000，NAT 网关打洞约束）。
+pub const DEFAULT_LISTEN_PORT: u16 = 42001;
 
 fn default_concurrent_games() -> u32 {
     DEFAULT_CONCURRENT_GAMES
@@ -28,6 +30,10 @@ fn default_disk_free_threshold() -> u64 {
 
 fn default_compact_threshold() -> f64 {
     DEFAULT_COMPACT_THRESHOLD
+}
+
+fn default_listen_port() -> u16 {
+    DEFAULT_LISTEN_PORT
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -59,6 +65,10 @@ pub struct Config {
     pub disk_free_threshold: u64,
     #[serde(default = "default_compact_threshold")]
     pub compact_threshold: f64,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    /// relay 地址；缺省仅直连。
+    pub relay_url: Option<String>,
 }
 
 impl Config {
@@ -110,6 +120,9 @@ impl Config {
         }
         if !(0.0 < self.compact_threshold && self.compact_threshold <= 1.0) {
             bail!("compact_threshold 必须在 (0, 1] 之间");
+        }
+        if self.listen_port < 10001 {
+            bail!("listen_port 必须大于 10000（NAT 网关打洞限制）");
         }
         Ok(())
     }
@@ -163,6 +176,7 @@ mod tests {
         assert_eq!(config.chunk_concurrency, DEFAULT_CHUNK_CONCURRENCY);
         assert_eq!(config.disk_free_threshold, DEFAULT_DISK_FREE_THRESHOLD);
         assert_eq!(config.compact_threshold, DEFAULT_COMPACT_THRESHOLD);
+        assert_eq!(config.listen_port, DEFAULT_LISTEN_PORT);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -239,6 +253,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("compact_threshold"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_listen_port() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-port");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\nlisten_port = 443\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("10000"));
         let _ = fs::remove_dir_all(&dir);
     }
 
