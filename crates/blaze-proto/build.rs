@@ -5,6 +5,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("PROTOC", protoc);
     }
-    tonic_prost_build::configure().compile_protos(&["proto/blazenet/upload.proto"], &["proto"])?;
+    tonic_prost_build::configure().compile_protos(
+        &[
+            "proto/blazenet/upload.proto",
+            "proto/blazenet/control.proto",
+        ],
+        &["proto"],
+    )?;
     Ok(())
 }

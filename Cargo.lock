@@ -857,6 +857,10 @@ name = "scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "redb",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]
