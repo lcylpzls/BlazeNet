@@ -1,7 +1,7 @@
 //! 原始节点上传服务：秒传查重、块上传（双向流）、版本提交。
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result, bail};
 use blaze_common::manifest::GameIndex;
@@ -19,7 +19,7 @@ use crate::storage::GameStore;
 /// 上传服务：每个游戏一个块库句柄，按游戏串行写入。
 pub struct UploadService {
     data_dir: PathBuf,
-    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
     scheduler_addr: Option<String>,
 }
 
@@ -29,7 +29,10 @@ impl UploadService {
     }
 
     /// 与数据面共享块库句柄，避免同一 redb 被重复打开。
-    pub fn with_stores(data_dir: PathBuf, stores: Arc<Mutex<HashMap<u64, GameStore>>>) -> Self {
+    pub fn with_stores(
+        data_dir: PathBuf,
+        stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
+    ) -> Self {
         Self {
             data_dir,
             stores,
@@ -134,7 +137,7 @@ fn append_ack(result: Result<(u64, u32), anyhow::Error>, hash: [u8; 32]) -> Uplo
 /// 处理一次块上传流：读取首包确定游戏，逐块校验入库并回 ack。
 async fn process_upload<S>(
     mut stream: S,
-    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
     data_dir: PathBuf,
     tx: tokio::sync::mpsc::Sender<Result<UploadAck, Status>>,
 ) -> Result<(), Status>
@@ -153,9 +156,9 @@ where
     let mut stores = stores.lock().await;
     let store = match stores.entry(first.game_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(GameStore::open(&data_dir, first.game_id).map_err(open_store_error)?)
-        }
+        std::collections::hash_map::Entry::Vacant(e) => e.insert(Arc::new(StdMutex::new(
+            GameStore::open(&data_dir, first.game_id).map_err(open_store_error)?,
+        ))),
     };
     let mut chunks = tokio_stream::once(Ok::<UploadChunk, Status>(first)).chain(stream);
     while let Some(chunk) = chunks.next().await {
@@ -173,6 +176,7 @@ where
                 error: "块哈希校验失败".to_string(),
             }
         } else {
+            let mut store = store.lock().expect("块库锁不应被污染");
             append_ack(store.append_chunk(&hash, &chunk.data), hash)
         };
         let _ = tx.send(Ok(ack)).await;
@@ -195,13 +199,14 @@ impl Upload for UploadService {
         let mut stores = self.stores.lock().await;
         let store = match stores.entry(query.game_id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(GameStore::open(&self.data_dir, query.game_id).map_err(open_store_error)?)
-            }
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(Arc::new(StdMutex::new(
+                GameStore::open(&self.data_dir, query.game_id).map_err(open_store_error)?,
+            ))),
         };
         let mut existing = Vec::new();
         for hash in query.chunk_hashes {
             let hash: [u8; 32] = hash.as_slice().try_into().map_err(bad_hash_len)?;
+            let store = store.lock().expect("块库锁不应被污染");
             if store.contains(&hash).map_err(query_chunk_error)? {
                 existing.push(hash.to_vec());
             }
@@ -252,11 +257,12 @@ impl Upload for UploadService {
             let mut stores = self.stores.lock().await;
             let store = match stores.entry(commit.game_id) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(Arc::new(StdMutex::new(
                     GameStore::open(&self.data_dir, commit.game_id).map_err(open_store_error)?,
-                ),
+                ))),
             };
             for hash in index.chunk_set() {
+                let store = store.lock().expect("块库锁不应被污染");
                 if !store.contains(&hash).map_err(query_chunk_error)? {
                     return Ok(Response::new(CommitReply {
                         published: false,

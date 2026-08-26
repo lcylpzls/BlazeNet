@@ -1,7 +1,10 @@
 //! 节点 agent 库：IDC 节点（Linux）与网吧服务器（Windows）共用实现（M4/M5）。
+pub mod cafe_store;
 pub mod config;
 pub mod control;
 pub mod download;
+pub mod executor;
+pub mod fetch;
 pub mod keepalive;
 pub mod stun;
 pub mod update;
@@ -9,10 +12,13 @@ pub mod update;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+use crate::config::NodeType;
+use crate::executor::TaskExecutor;
 
 /// agent 运行句柄：数据面 + 控制面任务。
 pub struct AgentHandle {
@@ -60,13 +66,20 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "无".to_string())
     );
-    let stores = Arc::new(Mutex::new(HashMap::new()));
+    let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<origin::storage::GameStore>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let data_stores: Arc<Mutex<HashMap<u64, origin::storage::NodeStore>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let cafe_stores: Arc<Mutex<HashMap<u64, Arc<cafe_store::CafeStore>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let handle = origin::datapath::serve(
-        stores,
+        data_stores.clone(),
+        pack_stores.clone(),
         config.data_dir.clone(),
         config.listen_port,
         config.relay_url.clone(),
         external_addr,
+        config.node_type == NodeType::Idc,
     )
     .await?;
     println!(
@@ -84,6 +97,18 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
         control_tasks.push(tokio::spawn(async move {
             let _ = keepalive::serve_pong(port, rx).await;
         }));
+        control_shutdown.push(tx);
+    }
+    if config.node_type == NodeType::Cafe {
+        let data_dir = config.data_dir.clone();
+        let ttl = config.temp_ttl_hours;
+        let (tx, rx) = oneshot::channel();
+        control_tasks.push(tokio::spawn(cafe_store::run_cleaner(
+            data_dir,
+            ttl,
+            std::time::Duration::from_secs(3600),
+            rx,
+        )));
         control_shutdown.push(tx);
     }
     if let Some(addr) = &config.control_addr {
@@ -111,6 +136,30 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
         println!("控制面注册成功：节点 ID {}", reply.node_id);
         let (tx_hb, rx_hb) = oneshot::channel();
         let (tx_watch, rx_watch) = oneshot::channel();
+        let executor = TaskExecutor::new(
+            config.clone(),
+            reply.node_id,
+            data_stores,
+            pack_stores,
+            cafe_stores,
+        );
+        let on_task = Arc::new(move |task: blaze_proto::control::Task| {
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                let _permit = executor.game_permits().acquire_owned().await;
+                match executor.run_task(task).await {
+                    Ok(()) => println!("任务执行完成"),
+                    Err(err) => println!("任务执行失败: {err:#}"),
+                }
+            });
+        });
+        for task in reply.initial_tasks {
+            println!(
+                "补推历史任务: ID {}，游戏 {}，版本 {}",
+                task.id, task.game_id, task.version
+            );
+            on_task(task);
+        }
         control_tasks.push(tokio::spawn(control::heartbeat_loop(
             client.clone(),
             reply.node_id,
@@ -120,6 +169,7 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
         control_tasks.push(tokio::spawn(control::watch_loop(
             client,
             reply.node_id,
+            on_task,
             rx_watch,
         )));
         control_shutdown.push(tx_hb);
@@ -181,18 +231,20 @@ mod tests {
         String,
         scheduler::server::ControlService,
         scheduler::server::ServerHandle,
+        std::sync::Arc<scheduler::db::Store>,
     ) {
         let dir = std::env::temp_dir().join("blaze-agent-sched");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let store = scheduler::db::Store::open(&dir).unwrap();
-        let service = scheduler::server::ControlService::new(std::sync::Arc::new(store));
+        let store = std::sync::Arc::new(store);
+        let service = scheduler::server::ControlService::new(store.clone());
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
         let svc = service.clone();
         let handle = scheduler::server::serve(addr, svc).await.unwrap();
-        (format!("http://{addr}"), service, handle)
+        (format!("http://{addr}"), service, handle, store)
     }
 
     #[tokio::test]
@@ -201,7 +253,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         seed(&dir, 1, 2).unwrap();
-        let (url, _service, _handle) = scheduler_setup().await;
+        let (url, _service, _handle, _store) = scheduler_setup().await;
         let handle = start(config::Config {
             node_type: config::NodeType::Idc,
             data_dir: dir.clone(),
@@ -210,6 +262,9 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            temp_ttl_hours: 24,
+            origin_endpoint: None,
+            origin_addr: None,
             keepalive_port: None,
             relay_url: None,
             external_addr: Some("127.0.0.1:42001".to_string()),
@@ -237,6 +292,9 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            temp_ttl_hours: 24,
+            origin_endpoint: None,
+            origin_addr: None,
             keepalive_port: None,
             relay_url: None,
             external_addr: None,
@@ -275,6 +333,9 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            temp_ttl_hours: 24,
+            origin_endpoint: None,
+            origin_addr: None,
             keepalive_port: Some(0),
             relay_url: None,
             external_addr: None,
@@ -301,7 +362,20 @@ mod tests {
             let _ = handle.send_to(reply.as_bytes(), src).await;
         });
 
-        let (url, _service, _handle) = scheduler_setup().await;
+        let (url, service, _handle, _store) = scheduler_setup().await;
+        service
+            .push_task(scheduler::db::TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 99,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
         let dir = std::env::temp_dir().join("blaze-agent-start4");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -313,6 +387,9 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            temp_ttl_hours: 24,
+            origin_endpoint: None,
+            origin_addr: None,
             keepalive_port: None,
             relay_url: None,
             external_addr: None,
@@ -322,8 +399,92 @@ mod tests {
         .await
         .unwrap();
         assert!(agent.port() > 0);
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         agent.shutdown();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_auto_executes_initial_task() {
+        let dir = std::env::temp_dir().join("blaze-agent-auto");
+        let _ = fs::remove_dir_all(&dir);
+        let seed_dir = dir.join("seed");
+        let idc_dir = dir.join("idc");
+        fs::create_dir_all(&seed_dir).unwrap();
+        fs::create_dir_all(&idc_dir).unwrap();
+
+        let data = b"auto";
+        let hash: [u8; 32] = blake3::hash(data).into();
+        let mut store = origin::storage::GameStore::open(&seed_dir, 1).unwrap();
+        store.append_chunk(&hash, data).unwrap();
+        let pack = Arc::new(StdMutex::new(store));
+        let pack_stores: Arc<
+            tokio::sync::Mutex<HashMap<u64, Arc<StdMutex<origin::storage::GameStore>>>>,
+        > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        pack_stores.lock().await.insert(1, pack.clone());
+        let data_stores: Arc<tokio::sync::Mutex<HashMap<u64, origin::storage::NodeStore>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        data_stores
+            .lock()
+            .await
+            .insert(1, origin::storage::NodeStore::Pack(pack));
+        let seed_handle =
+            origin::datapath::serve(data_stores, pack_stores, seed_dir, 0, None, None, true)
+                .await
+                .unwrap();
+
+        let index =
+            blaze_common::manifest::GameIndex::build(vec![blaze_common::manifest::FileEntry {
+                name: "a.bin".to_string(),
+                file_hash: hash,
+                chunks: vec![blaze_common::manifest::ChunkMeta {
+                    hash,
+                    len: data.len() as u32,
+                }],
+            }]);
+        let bytes = index.encode().unwrap();
+        let (url, service, _handle, store) = scheduler_setup().await;
+        store.save_version(1, 1, &bytes).unwrap();
+        service
+            .push_task(scheduler::db::TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+
+        let agent = start(config::Config {
+            node_type: config::NodeType::Idc,
+            data_dir: idc_dir,
+            concurrent_games: 2,
+            chunk_concurrency: 2,
+            disk_free_threshold: 1024,
+            compact_threshold: 0.3,
+            listen_port: 0,
+            temp_ttl_hours: 24,
+            origin_endpoint: Some(seed_handle.endpoint_id().to_string()),
+            origin_addr: Some(format!("127.0.0.1:{}", seed_handle.port())),
+            keepalive_port: None,
+            relay_url: None,
+            external_addr: None,
+            stun_addr: None,
+            control_addr: Some(url),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        agent.shutdown();
+        seed_handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let tasks = store.tasks_for_node(1).unwrap();
+        assert_eq!(tasks[0].status, "done");
         let _ = fs::remove_dir_all(&dir);
     }
 }

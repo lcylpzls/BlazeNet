@@ -24,4 +24,5 @@ tonic.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+iroh = { workspace = true, features = ["test-utils"] }
 scheduler = { path = "../scheduler" }

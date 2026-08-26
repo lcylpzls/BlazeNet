@@ -16,6 +16,8 @@ pub const DEFAULT_DISK_FREE_THRESHOLD: u64 = 200 * 1024 * 1024 * 1024;
 pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.3;
 /// 默认数据面监听端口（>10000，NAT 网关打洞约束）。
 pub const DEFAULT_LISTEN_PORT: u16 = 42001;
+/// 默认临时块保留时长（24 小时）。
+pub const DEFAULT_TEMP_TTL_HOURS: u64 = 24;
 
 fn default_concurrent_games() -> u32 {
     DEFAULT_CONCURRENT_GAMES
@@ -35,6 +37,10 @@ fn default_compact_threshold() -> f64 {
 
 fn default_listen_port() -> u16 {
     DEFAULT_LISTEN_PORT
+}
+
+fn default_temp_ttl_hours() -> u64 {
+    DEFAULT_TEMP_TTL_HOURS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -68,6 +74,13 @@ pub struct Config {
     pub compact_threshold: f64,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    /// 网吧临时块保留小时数（到期清理后改读真实文件偏移）。
+    #[serde(default = "default_temp_ttl_hours")]
+    pub temp_ttl_hours: u64,
+    /// IDC 回退源：原始节点数据面端点 ID。
+    pub origin_endpoint: Option<String>,
+    /// IDC 回退源：原始节点数据面地址（ip:port）。
+    pub origin_addr: Option<String>,
     /// 保活 pong 应答端口（独立 UDP，须可入站），缺省不启用。
     pub keepalive_port: Option<u16>,
     /// relay 地址；缺省仅直连。
@@ -132,6 +145,16 @@ impl Config {
         }
         if self.listen_port < 10001 {
             bail!("listen_port 必须大于 10000（NAT 网关打洞限制）");
+        }
+        if self.temp_ttl_hours == 0 {
+            bail!("temp_ttl_hours 必须大于 0");
+        }
+        if (self.origin_endpoint.is_some()) != (self.origin_addr.is_some()) {
+            bail!("origin_endpoint 与 origin_addr 必须同时配置或同时缺省");
+        }
+        if let Some(addr) = &self.origin_addr {
+            addr.parse::<SocketAddr>()
+                .map_err(|_| anyhow::anyhow!("origin_addr 必须是 ip:port"))?;
         }
         if let Some(port) = self.keepalive_port
             && port < 10001
@@ -205,6 +228,57 @@ mod tests {
         assert_eq!(config.disk_free_threshold, DEFAULT_DISK_FREE_THRESHOLD);
         assert_eq!(config.compact_threshold, DEFAULT_COMPACT_THRESHOLD);
         assert_eq!(config.listen_port, DEFAULT_LISTEN_PORT);
+        assert_eq!(config.temp_ttl_hours, DEFAULT_TEMP_TTL_HOURS);
+        assert_eq!(config.origin_endpoint, None);
+        assert_eq!(config.origin_addr, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_temp_ttl() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-ttl");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\ntemp_ttl_hours = 0\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("temp_ttl_hours"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_origin_mismatch() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-origin");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\norigin_endpoint = \"abc\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("origin_endpoint"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_origin_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-originaddr");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\norigin_endpoint = \"abc\"\norigin_addr = \"bad\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("origin_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 

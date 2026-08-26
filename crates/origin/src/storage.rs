@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 
 const INDEX_DB_NAME: &str = "index.redb";
 const PACK_FILE_NAME: &str = "blocks.pack";
@@ -28,6 +29,77 @@ fn unpack(value: u64) -> (u64, u32) {
 
 fn pack(offset: u64, len: u32) -> u64 {
     (offset << 32) | u64::from(len)
+}
+
+/// 块数据源抽象：IDC/原始节点用 pack 块库，网吧用临时块 + 真实文件偏移读。
+pub trait ChunkSource: Send + Sync {
+    /// 按哈希读取块数据；不存在返回 `None`。
+    fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>>;
+
+    /// 判断块是否存在。
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool>;
+}
+
+impl ChunkSource for GameStore {
+    fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>> {
+        self.read_chunk(hash)
+    }
+
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+        self.contains(hash)
+    }
+}
+
+impl ChunkSource for StdMutex<GameStore> {
+    fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>> {
+        let store = self.lock().expect("块库锁不应被污染");
+        store.read_chunk(hash)
+    }
+
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+        let store = self.lock().expect("块库锁不应被污染");
+        store.contains(hash)
+    }
+}
+
+impl<T: ChunkSource + ?Sized> ChunkSource for Arc<T> {
+    fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>> {
+        (**self).read_chunk(hash)
+    }
+
+    fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+        (**self).contains(hash)
+    }
+}
+
+/// 数据面统一的节点块源：IDC/原始节点用 pack 块库，网吧用真实文件/临时块。
+pub enum NodeStore {
+    Pack(Arc<StdMutex<GameStore>>),
+    Cafe(Arc<dyn ChunkSource>),
+}
+
+impl NodeStore {
+    /// 按哈希读取块数据；不存在返回 `None`。
+    pub fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Pack(store) => {
+                let store = store.lock().expect("块库锁不应被污染");
+                store.read_chunk(hash)
+            }
+            Self::Cafe(store) => store.read_chunk(hash),
+        }
+    }
+
+    /// 判断块是否存在。
+    pub fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+        match self {
+            Self::Pack(store) => {
+                let store = store.lock().expect("块库锁不应被污染");
+                store.contains(hash)
+            }
+            Self::Cafe(store) => store.contains(hash),
+        }
+    }
 }
 
 /// 单个游戏的块库。
@@ -366,6 +438,67 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let mut s = store(&dir, 1);
         assert!(!s.compact(&HashSet::new(), 0.0, 1024).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct MockSource {
+        hash: [u8; HASH_LEN],
+        data: Vec<u8>,
+    }
+
+    impl ChunkSource for MockSource {
+        fn read_chunk(&self, hash: &[u8; HASH_LEN]) -> Result<Option<Vec<u8>>> {
+            Ok((hash == &self.hash).then(|| self.data.clone()))
+        }
+
+        fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+            Ok(hash == &self.hash)
+        }
+    }
+
+    #[test]
+    fn test_chunk_source_impls() {
+        let dir = std::env::temp_dir().join("blaze-store-source");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h = hash(4);
+        s.append_chunk(&h, b"data").unwrap();
+
+        let source = &s as &dyn ChunkSource;
+        assert_eq!(source.read_chunk(&h).unwrap(), Some(b"data".to_vec()));
+        assert!(source.contains(&h).unwrap());
+
+        let mutex = StdMutex::new(s);
+        let source = &mutex as &dyn ChunkSource;
+        assert_eq!(source.read_chunk(&h).unwrap(), Some(b"data".to_vec()));
+        assert!(source.contains(&h).unwrap());
+
+        let arc: Arc<StdMutex<GameStore>> = Arc::new(mutex);
+        let source = &arc as &dyn ChunkSource;
+        assert_eq!(source.read_chunk(&h).unwrap(), Some(b"data".to_vec()));
+        assert!(source.contains(&h).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_node_store_pack_and_cafe() {
+        let dir = std::env::temp_dir().join("blaze-store-node");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h = hash(6);
+        s.append_chunk(&h, b"pack").unwrap();
+        let pack = NodeStore::Pack(Arc::new(StdMutex::new(s)));
+        assert_eq!(pack.read_chunk(&h).unwrap(), Some(b"pack".to_vec()));
+        assert!(pack.contains(&h).unwrap());
+        assert_eq!(pack.read_chunk(&hash(7)).unwrap(), None);
+
+        let cafe = NodeStore::Cafe(Arc::new(MockSource {
+            hash: h,
+            data: b"cafe".to_vec(),
+        }));
+        assert_eq!(cafe.read_chunk(&h).unwrap(), Some(b"cafe".to_vec()));
+        assert!(cafe.contains(&h).unwrap());
+        assert!(!cafe.contains(&hash(7)).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 }

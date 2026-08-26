@@ -1,9 +1,12 @@
 //! 控制面客户端：注册、心跳、任务流订阅。
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use blaze_proto::control::control_client::ControlClient;
-use blaze_proto::control::{Addr, HeartbeatRequest, RegisterRequest, Task, TaskFilter, task_event};
+use blaze_proto::control::{
+    Addr, HeartbeatRequest, RegisterRequest, Task, TaskFilter, TaskReport, VersionQuery, task_event,
+};
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
@@ -45,6 +48,44 @@ pub fn task_from_event(ev: Option<task_event::Ev>) -> Option<Task> {
     }
 }
 
+/// 上报任务状态。
+pub async fn report_task(
+    client: &mut ControlClient<Channel>,
+    node_id: u64,
+    task_id: u64,
+    status: &str,
+    error: &str,
+) -> Result<()> {
+    client
+        .report_task(TaskReport {
+            node_id,
+            task_id,
+            status: status.to_string(),
+            error: error.to_string(),
+        })
+        .await
+        .context("上报任务状态失败")?;
+    Ok(())
+}
+
+/// 查询版本清单；不存在返回 `None`。
+pub async fn get_version(
+    client: &mut ControlClient<Channel>,
+    game_id: u64,
+    version: u64,
+) -> Result<Option<Vec<u8>>> {
+    let reply = client
+        .get_version(VersionQuery { game_id, version })
+        .await
+        .context("查询版本清单失败")?
+        .into_inner();
+    if reply.found {
+        Ok(Some(reply.manifest))
+    } else {
+        Ok(None)
+    }
+}
+
 /// 心跳循环：每 25 秒上报一次，收到关闭信号退出。
 pub async fn heartbeat_loop(
     client: ControlClient<Channel>,
@@ -69,11 +110,14 @@ pub async fn heartbeat_loop(
 }
 
 /// 任务流订阅循环：断线自动重连。
-pub async fn watch_loop(
+pub async fn watch_loop<F>(
     client: ControlClient<Channel>,
     node_id: u64,
+    on_task: Arc<F>,
     mut shutdown: oneshot::Receiver<()>,
-) {
+) where
+    F: Fn(Task) + Send + Sync + 'static,
+{
     let mut client = client;
     loop {
         let mut stream = {
@@ -100,6 +144,7 @@ pub async fn watch_loop(
                             "收到任务: ID {}，游戏 {}，版本 {}",
                             task.id, task.game_id, task.version
                         );
+                        on_task(task);
                     }
                 }
             }
@@ -144,7 +189,7 @@ mod tests {
             rx,
         ));
         let (tx2, rx2) = oneshot::channel();
-        let watch = tokio::spawn(watch_loop(client, 1, rx2));
+        let watch = tokio::spawn(watch_loop(client, 1, Arc::new(|_| {}), rx2));
         tokio::time::sleep(Duration::from_millis(200)).await;
         service
             .push_task(scheduler::db::TaskRecord {
@@ -177,6 +222,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_report_and_get_version_helpers() {
+        let dir = std::env::temp_dir().join("blaze-ctl-helpers");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (url, _service, _handle) = setup(&dir).await;
+        let mut client = connect(&url).await.unwrap();
+        client
+            .publish_version(blaze_proto::control::PublishVersionRequest {
+                game_id: 1,
+                version: 1,
+                manifest: vec![1, 2, 3],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            get_version(&mut client, 1, 1).await.unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(get_version(&mut client, 1, 2).await.unwrap(), None);
+        report_task(&mut client, 1, 1, "done", "").await.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_watch_reconnect() {
         let dir = std::env::temp_dir().join("blaze-ctl-reconnect");
         let _ = fs::remove_dir_all(&dir);
@@ -187,7 +256,7 @@ mod tests {
         drop(handle);
         tokio::time::sleep(Duration::from_millis(500)).await;
         let (tx, rx) = oneshot::channel();
-        let watch = tokio::spawn(watch_loop(client, reply.node_id, rx));
+        let watch = tokio::spawn(watch_loop(client, reply.node_id, Arc::new(|_| {}), rx));
         tokio::time::sleep(Duration::from_millis(2500)).await;
         let _ = tx.send(());
         let _ = watch.await;
@@ -208,7 +277,7 @@ mod tests {
         let handle = origin::server::serve(addr, service).await.unwrap();
         let client = connect(&format!("http://{addr}")).await.unwrap();
         let (tx, rx) = oneshot::channel();
-        let watch = tokio::spawn(watch_loop(client, 1, rx));
+        let watch = tokio::spawn(watch_loop(client, 1, Arc::new(|_| {}), rx));
         tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = tx.send(());
         let _ = watch.await;

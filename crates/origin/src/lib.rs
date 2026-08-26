@@ -6,7 +6,7 @@ pub mod storage;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -31,10 +31,13 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
         config.compact_threshold * 100.0,
         config.min_free_bytes as f64 / 1024.0 / 1024.0 / 1024.0
     );
-    let stores = Arc::new(Mutex::new(HashMap::new()));
+    let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<storage::GameStore>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let data_stores: Arc<Mutex<HashMap<u64, storage::NodeStore>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let upload_handle = server::serve(
         config.bind_socket_addr()?,
-        server::UploadService::with_stores(config.data_dir.clone(), stores.clone())
+        server::UploadService::with_stores(config.data_dir.clone(), pack_stores.clone())
             .with_scheduler(config.scheduler_addr.clone()),
     )
     .await
@@ -45,11 +48,13 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
         .map(str::parse)
         .transpose()?;
     let data_handle = datapath::serve(
-        stores,
+        data_stores,
+        pack_stores,
         config.data_dir.clone(),
         config.listen_port,
         config.relay_url.clone(),
         external_addr,
+        true,
     )
     .await
     .context("启动数据面服务失败")?;

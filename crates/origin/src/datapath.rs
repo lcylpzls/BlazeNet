@@ -1,7 +1,7 @@
 //! 数据面块服务：iroh 自定义 ALPN，批量流式传块；relay-only 路径拒绝传块。
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result, anyhow};
 use blaze_common::manifest::HASH_LEN;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::storage::GameStore;
+use crate::storage::{GameStore, NodeStore};
 
 pub const ALPN: &[u8] = b"blazenet/1";
 
@@ -61,8 +61,10 @@ where
 
 async fn handle_conn(
     conn: Connection,
-    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    stores: Arc<Mutex<HashMap<u64, NodeStore>>>,
+    pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
     data_dir: PathBuf,
+    pack_default: bool,
 ) -> Result<()> {
     // NAT 打洞的直连路径可能延迟数秒建立，等待直连后再放行数据。
     let ready = wait_for_direct_path(
@@ -85,7 +87,18 @@ async fn handle_conn(
     let store = match stores.entry(game_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
-            e.insert(GameStore::open(&data_dir, game_id)?)
+            if !pack_default {
+                return Err(anyhow!("游戏未纳管: {game_id}"));
+            }
+            let pack = match pack_stores.lock().await.entry(game_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                std::collections::hash_map::Entry::Vacant(e) => e
+                    .insert(Arc::new(StdMutex::new(GameStore::open(
+                        &data_dir, game_id,
+                    )?)))
+                    .clone(),
+            };
+            e.insert(NodeStore::Pack(pack))
         }
     };
     for _ in 0..count {
@@ -105,8 +118,10 @@ async fn handle_conn(
 
 async fn accept_loop(
     endpoint: Endpoint,
-    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    stores: Arc<Mutex<HashMap<u64, NodeStore>>>,
+    pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
     data_dir: PathBuf,
+    pack_default: bool,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     loop {
@@ -116,9 +131,13 @@ async fn accept_loop(
                 let _ = incoming.map(|incoming| {
                     let data_dir = data_dir.clone();
                     let stores = stores.clone();
+                    let pack_stores = pack_stores.clone();
                     tokio::spawn(async move {
                         if let Ok(conn) = incoming.await
-                            && let Err(err) = handle_conn(conn, stores, data_dir).await
+                            && let Err(err) = handle_conn(
+                                conn, stores, pack_stores, data_dir, pack_default,
+                            )
+                            .await
                         {
                             println!("连接处理失败: {err:#}");
                         }
@@ -157,11 +176,13 @@ impl DataPathHandle {
 
 /// 启动数据面块服务。
 pub async fn serve(
-    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    stores: Arc<Mutex<HashMap<u64, NodeStore>>>,
+    pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>>,
     data_dir: PathBuf,
     listen_port: u16,
     relay_url: Option<String>,
     external_addr: Option<std::net::SocketAddr>,
+    pack_default: bool,
 ) -> Result<DataPathHandle> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
@@ -193,7 +214,14 @@ pub async fn serve(
         .unwrap_or(listen_port);
     let (tx, rx) = oneshot::channel();
     let endpoint_id = endpoint.id();
-    let task = tokio::spawn(accept_loop(endpoint.clone(), stores, data_dir, rx));
+    let task = tokio::spawn(accept_loop(
+        endpoint.clone(),
+        stores,
+        pack_stores,
+        data_dir,
+        pack_default,
+        rx,
+    ));
     // 等待 accept 循环就绪，避免测试/调用方立即连接失败
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     Ok(DataPathHandle {
@@ -271,10 +299,17 @@ mod tests {
         let h2 = hash_of(&d2);
         store.append_chunk(&h1, &d1).unwrap();
         store.append_chunk(&h2, &d2).unwrap();
-        let stores = Arc::new(Mutex::new(HashMap::new()));
-        stores.lock().await.insert(3, store);
+        let stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        stores
+            .lock()
+            .await
+            .insert(3, NodeStore::Pack(Arc::new(StdMutex::new(store))));
 
-        let handle = serve(stores, dir.clone(), 0, None, None).await.unwrap();
+        let handle = serve(stores, pack_stores, dir.clone(), 0, None, None, true)
+            .await
+            .unwrap();
         let out = fetch(&handle, 3, &[h1, h2]).await.unwrap();
         assert_eq!(out, vec![d1, d2]);
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -290,13 +325,17 @@ mod tests {
         let dir = std::env::temp_dir().join("blaze-agent-dp-relay");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let stores = Arc::new(Mutex::new(HashMap::new()));
+        let stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let handle = serve(
             stores,
+            pack_stores,
             dir.clone(),
             0,
             Some("https://127.0.0.1:1".to_string()),
             Some("127.0.0.1:42001".parse().unwrap()),
+            true,
         )
         .await
         .unwrap();
@@ -307,8 +346,12 @@ mod tests {
 
         let data_file = dir.join("data-file");
         fs::write(&data_file, b"x").unwrap();
-        let stores2 = Arc::new(Mutex::new(HashMap::new()));
-        let handle2 = serve(stores2, data_file, 0, None, None).await.unwrap();
+        let stores2: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pack_stores2: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let handle2 = serve(stores2, pack_stores2, data_file, 0, None, None, true)
+            .await
+            .unwrap();
         assert!(fetch(&handle2, 1, &[[1u8; 32]]).await.is_err());
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle2.shutdown();
@@ -356,5 +399,72 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_direct_path_relay_lost() {
         assert!(!wait_for_direct_path(|| (false, false), Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_cafe_unmanaged_rejected() {
+        let dir = std::env::temp_dir().join("blaze-dp-cafe");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let handle = serve(stores, pack_stores, dir.clone(), 0, None, None, false)
+            .await
+            .unwrap();
+        assert!(fetch(&handle, 1, &[[1u8; 32]]).await.is_err());
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_lazy_pack_store_occupied_and_from_disk() {
+        let dir = std::env::temp_dir().join("blaze-dp-lazy");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d1 = b"lazy".to_vec();
+        let h1 = hash_of(&d1);
+
+        // 块库已由上传服务持有：数据面延迟登记 Pack 节点。
+        let mut s = GameStore::open(&dir, 3).unwrap();
+        s.append_chunk(&h1, &d1).unwrap();
+        let pack = Arc::new(StdMutex::new(s));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        pack_stores.lock().await.insert(3, pack);
+        let data_stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        let handle = serve(
+            data_stores,
+            pack_stores.clone(),
+            dir.clone(),
+            0,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetch(&handle, 3, &[h1]).await.unwrap(), vec![d1.clone()]);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(pack_stores);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 磁盘已有块库：数据面按需打开新句柄。
+        let data_stores2: Arc<Mutex<HashMap<u64, NodeStore>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pack_stores2: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let handle2 = serve(data_stores2, pack_stores2, dir.clone(), 0, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(fetch(&handle2, 3, &[h1]).await.unwrap(), vec![d1]);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle2.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = fs::remove_dir_all(&dir);
     }
 }
