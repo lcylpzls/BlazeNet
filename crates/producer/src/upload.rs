@@ -305,6 +305,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upload_large_chunk_over_4mb() {
+        let dir = std::env::temp_dir().join("blaze-producer-large");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (url, shutdown) = spawn_origin(&dir);
+        let mut client = connect(&url).await.unwrap();
+        let data = vec![7u8; 5 * 1024 * 1024];
+        let hash = hash_of(&data);
+        let stage = dir.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(format!("{}.blk", hex(&hash))), &data).unwrap();
+        let summary = upload_delta(&mut client, 1, &stage, &[hash], &None)
+            .await
+            .unwrap();
+        assert_eq!(summary.uploaded, 1);
+        assert!(summary.failed.is_empty());
+        let _ = shutdown.send(());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_upload_staged_chunk_read_error() {
         let dir = std::env::temp_dir().join("blaze-producer-readerr");
         let _ = fs::remove_dir_all(&dir);

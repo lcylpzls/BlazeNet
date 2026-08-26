@@ -129,7 +129,9 @@ pub fn run_with_config(path: &Path) -> Result<()> {
             let mut client =
                 blaze_proto::upload::upload_client::UploadClient::connect(addr.clone())
                     .await
-                    .context(format!("连接原始节点失败: {addr}"))?;
+                    .context(format!("连接原始节点失败: {addr}"))?
+                    .max_decoding_message_size(16 * 1024 * 1024)
+                    .max_encoding_message_size(16 * 1024 * 1024);
             // 流式上传：边读暂存块边发送，避免全部差异块载入内存。
             let summary = upload::upload_delta(
                 &mut client,
@@ -139,6 +141,12 @@ pub fn run_with_config(path: &Path) -> Result<()> {
                 &config.origin_token,
             )
             .await?;
+            println!(
+                "  上传完成: 新传 {} 块，秒传跳过 {} 块，失败 {} 块",
+                summary.uploaded,
+                summary.skipped,
+                summary.failed.len()
+            );
             upload::commit_version(
                 &mut client,
                 config.game_id,
@@ -151,12 +159,7 @@ pub fn run_with_config(path: &Path) -> Result<()> {
             Ok(summary)
         });
         let summary = result?;
-        println!(
-            "  上传完成: 新传 {} 块，秒传跳过 {} 块，失败 {} 块",
-            summary.uploaded,
-            summary.skipped,
-            summary.failed.len()
-        );
+        let _ = summary;
     }
 
     println!("制作完成: 游戏 {} 版本 {}", config.game_id, config.version);

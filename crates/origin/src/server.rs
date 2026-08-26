@@ -225,7 +225,9 @@ impl Upload for UploadService {
         let stores = self.stores.clone();
         let data_dir = self.data_dir.clone();
         tokio::spawn(async move {
-            let _ = process_upload(stream, stores, data_dir, tx).await;
+            if let Err(err) = process_upload(stream, stores, data_dir, tx).await {
+                eprintln!("上传流处理失败: {err}");
+            }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -261,14 +263,26 @@ impl Upload for UploadService {
                     GameStore::open(&self.data_dir, commit.game_id).map_err(open_store_error)?,
                 ))),
             };
+            let mut missing = Vec::new();
             for hash in index.chunk_set() {
                 let store = store.lock().expect("块库锁不应被污染");
                 if !store.contains(&hash).map_err(query_chunk_error)? {
-                    return Ok(Response::new(CommitReply {
-                        published: false,
-                        error: "版本清单引用的块未齐全".to_string(),
-                    }));
+                    missing.push(hash);
+                    if missing.len() >= 5 {
+                        break;
+                    }
                 }
+            }
+            if !missing.is_empty() {
+                let detail = missing
+                    .iter()
+                    .map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Ok(Response::new(CommitReply {
+                    published: false,
+                    error: format!("版本清单引用的块未齐全，缺失示例: {detail}"),
+                }));
             }
             let published_dir = self
                 .data_dir
@@ -312,9 +326,11 @@ pub async fn serve(addr: std::net::SocketAddr, service: UploadService) -> Result
     let incoming = tonic::transport::server::TcpIncoming::bind(addr)?;
     tokio::spawn(async move {
         let result = tonic::transport::Server::builder()
-            .add_service(blaze_proto::upload::upload_server::UploadServer::new(
-                service,
-            ))
+            .add_service(
+                blaze_proto::upload::upload_server::UploadServer::new(service)
+                    .max_decoding_message_size(16 * 1024 * 1024)
+                    .max_encoding_message_size(16 * 1024 * 1024),
+            )
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = rx.await;
             })
@@ -462,6 +478,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message().contains("打开块库失败"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upload_stream_broken_data_dir() {
+        let dir = std::env::temp_dir().join("blaze-upload-stream-broken");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("data-file");
+        fs::write(&data_file, b"x").unwrap();
+        let service = UploadService::new(data_file);
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _handle = serve(addr, service).await.unwrap();
+        let mut client = connect_retry(&format!("http://{addr}")).await.unwrap();
+        let chunk = UploadChunk {
+            game_id: 1,
+            chunk_hash: [7u8; 32].to_vec(),
+            data: b"hello".to_vec(),
+            seq: 0,
+        };
+        let stream = tokio_stream::iter(vec![chunk]);
+        let mut response = client
+            .upload_chunks(tonic::Request::new(stream))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.next().await.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

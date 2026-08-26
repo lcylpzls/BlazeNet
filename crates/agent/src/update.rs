@@ -86,7 +86,9 @@ fn write_new_file(
     let mut hasher = blake3::Hasher::new();
     for chunk in &entry.chunks {
         let data = if let (Some(old_file), Some(map)) = (old_file, old_chunks) {
-            if let Some((offset, len)) = map.get(&chunk.hash) {
+            if old_file.is_file()
+                && let Some((offset, len)) = map.get(&chunk.hash)
+            {
                 read_chunk_at(old_file, *offset, *len)?
             } else {
                 fs::read(temp_dir.join(format!("{}.blk", hex(&chunk.hash))))
@@ -144,9 +146,10 @@ pub fn merge_files(
 
     let mut summary = MergeSummary::default();
     for entry in &new.files {
+        let target_exists = game_dir.join(&entry.name).is_file();
         let need_merge = match old_files.get(entry.name.as_str()) {
             None => true,
-            Some(prev) => prev.file_hash != entry.file_hash,
+            Some(prev) => prev.file_hash != entry.file_hash || !target_exists,
         };
         if !need_merge {
             continue;
@@ -317,6 +320,34 @@ mod tests {
         assert_eq!(summary.merged, 0);
         assert_eq!(fs::read(game_dir.join("a.bin")).unwrap(), old_a);
         assert!(!game_dir.join("a.bin.new").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_repairs_missing_file() {
+        let dir = std::env::temp_dir().join("blaze-upd-repair");
+        let _ = fs::remove_dir_all(&dir);
+        let game_dir = dir.join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+        let temp_dir = dir.join("temp");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let data = b"hello".to_vec();
+        let hash = hash_of(&data);
+        let manifest = index(vec![FileEntry {
+            name: "a.bin".to_string(),
+            file_hash: hash,
+            chunks: vec![ChunkMeta {
+                hash,
+                len: data.len() as u32,
+            }],
+        }]);
+        fs::write(game_dir.join("a.bin"), &data).unwrap();
+        fs::remove_file(game_dir.join("a.bin")).unwrap();
+        fs::write(temp_dir.join(format!("{}.blk", hex(&hash))), &data).unwrap();
+        let summary = merge_files(&game_dir, &manifest, Some(&manifest), &temp_dir).unwrap();
+        assert!(summary.failed.is_empty());
+        assert_eq!(summary.merged, 1);
+        assert_eq!(fs::read(game_dir.join("a.bin")).unwrap(), data);
         let _ = fs::remove_dir_all(&dir);
     }
 }

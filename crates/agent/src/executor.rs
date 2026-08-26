@@ -1,5 +1,5 @@
 //! 任务执行器：拉版本清单 → 对账 → 多源下载 → 入库/合并 → 上报。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -159,7 +159,19 @@ impl TaskExecutor {
             .transpose()
             .context("解析旧版本清单失败")?;
         let temp_hashes = update::collect_temp_hashes(&temp_dir)?;
-        let plan = update_plan::compute(index, old.as_ref(), &temp_hashes);
+        let mut plan = update_plan::compute(index, old.as_ref(), &temp_hashes);
+        // 真实文件缺失时（如磁盘写满中断），补齐对应块以便重新合并。
+        let mut repair_chunks = HashSet::new();
+        for entry in &index.files {
+            if !game_dir.join(&entry.name).is_file() {
+                for chunk in &entry.chunks {
+                    repair_chunks.insert(chunk.hash);
+                }
+            }
+        }
+        plan.chunks_to_download.extend(repair_chunks);
+        plan.chunks_to_download.sort_unstable();
+        plan.chunks_to_download.dedup();
         self.download_missing(
             client,
             game_id,
@@ -171,7 +183,10 @@ impl TaskExecutor {
             },
         )
         .await?;
-        update::merge_files(&game_dir, index, old.as_ref(), &temp_dir)?;
+        let merge = update::merge_files(&game_dir, index, old.as_ref(), &temp_dir)?;
+        if !merge.failed.is_empty() {
+            bail!("合并失败: {}", merge.failed.join("; "));
+        }
         cafe.save_manifest(task.version, manifest)?;
         let mut held: Vec<[u8; 32]> = index.chunk_set().into_iter().collect();
         held.sort();
@@ -590,6 +605,32 @@ mod tests {
         let cafe = cafe_stores.lock().await.get(&1).unwrap().clone();
         assert_eq!(cafe.current_version().unwrap(), Some(1));
         assert_eq!(store.tasks_for_node(1).unwrap()[0].status, "done");
+
+        // 真实文件被删除后重跑同版本任务：补齐块并修复文件。
+        std::fs::remove_file(cafe_dir.join("games/1/dir/a.bin")).unwrap();
+        std::fs::remove_file(
+            crate::cafe_store::temp_dir(&cafe_dir, 1)
+                .join(format!("{}.blk", crate::update::hex(&hashes[0]))),
+        )
+        .unwrap();
+        service
+            .push_task(TaskRecord {
+                id: 3,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+        exec.run_task(task(3, 1, 1)).await.unwrap();
+        assert_eq!(
+            std::fs::read(cafe_dir.join("games/1/dir/a.bin")).unwrap(),
+            b"hello"
+        );
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -885,6 +926,53 @@ mod tests {
         assert!(!cafe_dir.join("games/1/b.bin").exists());
         let cafe = cafe_stores.lock().await.get(&1).unwrap().clone();
         assert_eq!(cafe.current_version().unwrap(), Some(1));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cafe_merge_failure_reported() {
+        let dir = std::env::temp_dir().join("blaze-exec-mergefail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_dir = dir.join("seed");
+        let cafe_dir = dir.join("cafe");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&cafe_dir).unwrap();
+        let (handle, hashes) = seed_server(&seed_dir, 1).await;
+        // 清单 file_hash 错误：块齐全但合并后哈希校验必然失败。
+        let wrong_index = GameIndex::build(vec![blaze_common::manifest::FileEntry {
+            name: "a.bin".to_string(),
+            file_hash: [9u8; 32],
+            chunks: vec![blaze_common::manifest::ChunkMeta {
+                hash: hashes[0],
+                len: 5,
+            }],
+        }]);
+        let bytes = wrong_index.encode().unwrap();
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "peer".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store.record_chunk_holder(2, 1, &hashes[0]).unwrap();
+        let (exec, _data, _pack, _cafe) =
+            executor(config(NodeType::Cafe, cafe_dir, url, None, None), 1);
+        let err = exec.run_task(task(1, 1, 1)).await.unwrap_err();
+        assert!(err.to_string().contains("合并失败"));
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

@@ -56,6 +56,8 @@ pub struct CreateGroupRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateGameRequest {
     name: String,
+    /// 指定游戏 ID（内部/迁移用）；缺省自动分配。
+    id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,8 +308,16 @@ async fn create_game(
     if request.name.is_empty() {
         return Err(bad_request());
     }
+    let id = match request.id {
+        Some(0) => return Err(bad_request()),
+        Some(id) if state.store.get_game(id).map_err(store_error)?.is_some() => {
+            return Err(bad_request());
+        }
+        Some(id) => id,
+        None => state.store.next_game_id().map_err(store_error)?,
+    };
     let game = GameRecord {
-        id: state.store.next_game_id().map_err(store_error)?,
+        id,
         name: request.name,
         status: "uploading".to_string(),
         current_version: 0,
@@ -1079,6 +1089,54 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(text.contains("创建账号"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_game_with_explicit_id() {
+        let dir = std::env::temp_dir().join("blaze-http-gameid");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (app, store) = app_with_store(&dir);
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"X","id":11}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(store.get_game(11).unwrap().is_some());
+        let dup = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Y","id":11}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+        let zero = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Z","id":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
         let _ = fs::remove_dir_all(&dir);
     }
 }

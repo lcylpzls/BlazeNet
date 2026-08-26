@@ -75,6 +75,12 @@ fn main() -> Result<()> {
             missing.len(),
             if hash_ok { "通过" } else { "失败" }
         );
+        for hash in missing.iter().take(10) {
+            println!(
+                "  缺失块: {}",
+                hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+        }
         versions.push((version, chunks, index.files.len()));
     }
     if versions.len() >= 2 {
