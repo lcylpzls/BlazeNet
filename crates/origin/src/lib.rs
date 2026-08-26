@@ -34,7 +34,8 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
     let stores = Arc::new(Mutex::new(HashMap::new()));
     let upload_handle = server::serve(
         config.bind_socket_addr()?,
-        server::UploadService::with_stores(config.data_dir.clone(), stores.clone()),
+        server::UploadService::with_stores(config.data_dir.clone(), stores.clone())
+            .with_scheduler(config.scheduler_addr.clone()),
     )
     .await
     .context("启动上传服务失败")?;
@@ -110,6 +111,7 @@ mod tests {
             listen_port: 0,
             external_addr: None,
             relay_url: None,
+            scheduler_addr: None,
             compact_threshold: 0.3,
             min_free_bytes: 1024,
         };

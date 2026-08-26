@@ -7,8 +7,8 @@ use anyhow::Result;
 use blaze_proto::control::control_server::Control;
 use blaze_proto::control::{
     Addr, ChunkDone, Empty, HeartbeatReply, HeartbeatRequest, Peer, PeerList, PeerQuery,
-    RegisterReply, RegisterRequest, Task, TaskEvent, TaskFilter, TaskReport, VersionInfo,
-    VersionQuery, task_event,
+    PublishVersionReply, PublishVersionRequest, RegisterReply, RegisterRequest, Task, TaskEvent,
+    TaskFilter, TaskReport, VersionInfo, VersionQuery, task_event,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,6 +21,14 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn version_query_error(err: anyhow::Error) -> Status {
+    Status::internal(format!("查询版本清单失败: {err}"))
+}
+
+fn version_save_error(err: anyhow::Error) -> Status {
+    Status::internal(format!("保存版本清单失败: {err}"))
 }
 
 fn valid_node_type(node_type: &str) -> bool {
@@ -283,12 +291,51 @@ impl Control for ControlService {
 
     async fn get_version(
         &self,
-        _request: Request<VersionQuery>,
+        request: Request<VersionQuery>,
     ) -> Result<Response<VersionInfo>, Status> {
+        let query = request.into_inner();
+        let manifest = self
+            .store
+            .get_version(query.game_id, query.version)
+            .map_err(version_query_error)?;
+        let Some(manifest) = manifest else {
+            return Ok(Response::new(VersionInfo {
+                found: false,
+                version: query.version,
+                manifest: vec![],
+            }));
+        };
         Ok(Response::new(VersionInfo {
-            found: false,
-            version: 0,
-            manifest: vec![],
+            found: true,
+            version: query.version,
+            manifest,
+        }))
+    }
+
+    async fn publish_version(
+        &self,
+        request: Request<PublishVersionRequest>,
+    ) -> Result<Response<PublishVersionReply>, Status> {
+        let req = request.into_inner();
+        if req.game_id == 0 || req.version == 0 {
+            return Err(Status::invalid_argument("game_id 与 version 必须大于 0"));
+        }
+        if req.manifest.is_empty() {
+            return Err(Status::invalid_argument("版本清单不能为空"));
+        }
+        self.store
+            .save_version(req.game_id, req.version, &req.manifest)
+            .map_err(version_save_error)?;
+        if let Ok(Some(mut game)) = self.store.get_game(req.game_id)
+            && req.version > game.latest_version
+        {
+            game.latest_version = req.version;
+            let _ = self.store.insert_game(&game);
+        }
+        println!("收到版本发布: 游戏 {} 版本 {}", req.game_id, req.version);
+        Ok(Response::new(PublishVersionReply {
+            ok: true,
+            error: String::new(),
         }))
     }
 }
@@ -541,6 +588,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_publish_and_get_version() {
+        let dir = std::env::temp_dir().join("blaze-sched-pubver");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (mut client, _handle, _service) = setup(&dir).await;
+        let reply = client
+            .publish_version(blaze_proto::control::PublishVersionRequest {
+                game_id: 1,
+                version: 2,
+                manifest: b"manifest-v2".to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.ok);
+        let version = client
+            .get_version(blaze_proto::control::VersionQuery {
+                game_id: 1,
+                version: 2,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(version.found);
+        assert_eq!(version.manifest, b"manifest-v2".to_vec());
+        let missing = client
+            .get_version(blaze_proto::control::VersionQuery {
+                game_id: 1,
+                version: 3,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!missing.found);
+        let err = client
+            .publish_version(blaze_proto::control::PublishVersionRequest {
+                game_id: 0,
+                version: 1,
+                manifest: b"x".to_vec(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("大于 0"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_watch_empty_then_drop() {
         let dir = std::env::temp_dir().join("blaze-sched-watch");
         let _ = fs::remove_dir_all(&dir);
@@ -666,6 +760,16 @@ mod tests {
         assert_eq!(task_kind("未知"), 0);
         assert!(bad_node_type().message().contains("node_type"));
         assert!(node_not_found().message().contains("节点未注册"));
+        assert!(
+            version_query_error(anyhow::anyhow!("x"))
+                .message()
+                .contains("查询版本清单失败")
+        );
+        assert!(
+            version_save_error(anyhow::anyhow!("x"))
+                .message()
+                .contains("保存版本清单失败")
+        );
         assert!(
             alloc_node_id_error(anyhow::anyhow!("x"))
                 .message()

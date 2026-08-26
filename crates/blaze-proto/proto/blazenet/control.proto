@@ -18,6 +18,8 @@ service Control {
   rpc QueryPeers(PeerQuery) returns (PeerList);
   // 查询版本清单
   rpc GetVersion(VersionQuery) returns (VersionInfo);
+  // 原始节点提交版本后发布清单到调度中心
+  rpc PublishVersion(PublishVersionRequest) returns (PublishVersionReply);
 }
 
 message RegisterRequest {
@@ -118,6 +120,17 @@ message VersionInfo {
   bool found = 1;
   uint64 version = 2;
   bytes manifest = 3;
+}
+
+message PublishVersionRequest {
+  uint64 game_id = 1;
+  uint64 version = 2;
+  bytes manifest = 3;
+}
+
+message PublishVersionReply {
+  bool ok = 1;
+  string error = 2;
 }
 
 message Empty {}

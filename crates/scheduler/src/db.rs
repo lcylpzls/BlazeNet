@@ -15,6 +15,7 @@ const PLACES: TableDefinition<u64, String> = TableDefinition::new("places");
 const GROUPS: TableDefinition<u64, String> = TableDefinition::new("groups");
 const BINDINGS: TableDefinition<String, u64> = TableDefinition::new("bindings");
 const GAMES: TableDefinition<u64, String> = TableDefinition::new("games");
+const VERSIONS: TableDefinition<String, String> = TableDefinition::new("versions");
 
 const NEXT_NODE_ID: &str = "next_node_id";
 const NEXT_TASK_ID: &str = "next_task_id";
@@ -116,6 +117,9 @@ fn ensure_tables(db: &Database) -> Result<()> {
         .open_table(BINDINGS)
         .context("创建 bindings 表失败")?;
     write_txn.open_table(GAMES).context("创建 games 表失败")?;
+    write_txn
+        .open_table(VERSIONS)
+        .context("创建 versions 表失败")?;
     write_txn.commit().context("提交建表事务失败")?;
     Ok(())
 }
@@ -480,6 +484,34 @@ impl Store {
         self.delete_json(GAMES, id)
     }
 
+    /// 保存版本清单（幂等覆盖）。
+    pub fn save_version(&self, game_id: u64, version: u64, manifest: &[u8]) -> Result<()> {
+        let key = format!("{game_id}:{version}");
+        let value = encode(&manifest.to_vec())?;
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        {
+            let mut table = write_txn
+                .open_table(VERSIONS)
+                .context("打开 versions 表失败")?;
+            table.insert(key, value).context("写入版本清单失败")?;
+        }
+        write_txn.commit().context("提交版本事务失败")?;
+        Ok(())
+    }
+
+    /// 读取版本清单，不存在返回 `None`。
+    pub fn get_version(&self, game_id: u64, version: u64) -> Result<Option<Vec<u8>>> {
+        let key = format!("{game_id}:{version}");
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn
+            .open_table(VERSIONS)
+            .context("打开 versions 表失败")?;
+        let Some(value) = table.get(key).context("查询版本清单失败")? else {
+            return Ok(None);
+        };
+        Ok(Some(decode(&value.value())?))
+    }
+
     /// 建立绑定（幂等）。
     pub fn bind(&self, kind: &str, a: u64, b: u64) -> Result<()> {
         let key = format!("{kind}/{a}/{b}");
@@ -768,6 +800,21 @@ mod tests {
         let s = store(&dir);
         assert!(dir.is_dir());
         assert!(s.next_node_id().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_version_roundtrip() {
+        let dir = std::env::temp_dir().join("blaze-sched-version");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        assert_eq!(s.get_version(1, 1).unwrap(), None);
+        s.save_version(1, 1, b"manifest-v1").unwrap();
+        s.save_version(1, 2, b"manifest-v2").unwrap();
+        assert_eq!(s.get_version(1, 1).unwrap(), Some(b"manifest-v1".to_vec()));
+        assert_eq!(s.get_version(1, 2).unwrap(), Some(b"manifest-v2".to_vec()));
+        s.save_version(1, 1, b"overwrite").unwrap();
+        assert_eq!(s.get_version(1, 1).unwrap(), Some(b"overwrite".to_vec()));
         let _ = fs::remove_dir_all(&dir);
     }
 }

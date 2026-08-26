@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use blaze_common::manifest::GameIndex;
+use blaze_proto::control::{PublishVersionRequest, control_client::ControlClient};
 use blaze_proto::upload::upload_server::Upload;
 use blaze_proto::upload::{
     ChunkExists, ChunkQuery, CommitReply, CommitRequest, UploadAck, UploadChunk,
@@ -19,6 +20,7 @@ use crate::storage::GameStore;
 pub struct UploadService {
     data_dir: PathBuf,
     stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    scheduler_addr: Option<String>,
 }
 
 impl UploadService {
@@ -28,8 +30,57 @@ impl UploadService {
 
     /// 与数据面共享块库句柄，避免同一 redb 被重复打开。
     pub fn with_stores(data_dir: PathBuf, stores: Arc<Mutex<HashMap<u64, GameStore>>>) -> Self {
-        Self { data_dir, stores }
+        Self {
+            data_dir,
+            stores,
+            scheduler_addr: None,
+        }
     }
+
+    /// 设置调度中心地址：版本提交成功后自动发布清单。
+    pub fn with_scheduler(mut self, addr: Option<String>) -> Self {
+        self.scheduler_addr = addr;
+        self
+    }
+}
+
+/// 把版本清单发布到调度中心。
+async fn publish_to_scheduler(
+    addr: &str,
+    game_id: u64,
+    version: u64,
+    manifest: &[u8],
+) -> Result<()> {
+    let mut client = connect_control(addr).await?;
+    let reply = client
+        .publish_version(PublishVersionRequest {
+            game_id,
+            version,
+            manifest: manifest.to_vec(),
+        })
+        .await
+        .context("发布版本失败")?
+        .into_inner();
+    ensure_publish_ok(reply.ok, &reply.error)
+}
+
+/// 连接调度中心控制面（带短重试，容忍服务启动竞态）。
+async fn connect_control(addr: &str) -> Result<ControlClient<tonic::transport::Channel>> {
+    for _ in 0..30 {
+        if let Ok(client) = ControlClient::connect(addr.to_string()).await {
+            return Ok(client);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    anyhow::bail!("连接调度中心失败: {addr}");
+}
+
+/// 校验调度中心发布应答；拒绝时返回错误。
+fn ensure_publish_ok(ok: bool, error: &str) -> Result<()> {
+    if !ok {
+        bail!("调度中心拒绝发布: {error}");
+    }
+    Ok(())
 }
 
 fn open_store_error(err: anyhow::Error) -> Status {
@@ -217,6 +268,15 @@ impl Upload for UploadService {
             &commit.manifest,
         )
         .map_err(write_manifest_error)?;
+        if let Some(addr) = &self.scheduler_addr
+            && let Err(err) =
+                publish_to_scheduler(addr, commit.game_id, commit.version, &commit.manifest).await
+        {
+            return Ok(Response::new(CommitReply {
+                published: false,
+                error: format!("发布到调度中心失败: {err:#}"),
+            }));
+        }
         Ok(Response::new(CommitReply {
             published: true,
             error: String::new(),
@@ -608,6 +668,94 @@ mod tests {
             .unwrap_err();
         assert!(err.message().contains("写入版本清单失败"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    async fn scheduler_setup() -> (String, scheduler::server::ServerHandle) {
+        let dir = std::env::temp_dir().join("blaze-origin-sched");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = scheduler::db::Store::open(&dir).unwrap();
+        let service = scheduler::server::ControlService::new(std::sync::Arc::new(store));
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let handle = scheduler::server::serve(addr, service).await.unwrap();
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn test_commit_publishes_to_scheduler() {
+        let dir = std::env::temp_dir().join("blaze-upload-publish");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (sched_url, _sched_handle) = scheduler_setup().await;
+        let service = UploadService::new(dir.clone()).with_scheduler(Some(sched_url.clone()));
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _handle = serve(addr, service).await.unwrap();
+        let mut client = connect_retry(&format!("http://{addr}")).await.unwrap();
+        let empty_index = GameIndex::build(vec![]);
+        let manifest = empty_index.encode().unwrap();
+        let reply = client
+            .commit_version(CommitRequest {
+                game_id: 1,
+                version: 3,
+                manifest: manifest.clone(),
+                manifest_hash: empty_index.manifest_hash.to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.published, "{}", reply.error);
+        let mut sched = connect_control(&sched_url).await.unwrap();
+        let version = sched
+            .get_version(blaze_proto::control::VersionQuery {
+                game_id: 1,
+                version: 3,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(version.found);
+        assert_eq!(version.manifest, manifest);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_commit_publish_failure() {
+        let dir = std::env::temp_dir().join("blaze-upload-pubfail");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let service =
+            UploadService::new(dir.clone()).with_scheduler(Some("http://127.0.0.1:1".to_string()));
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let _handle = serve(addr, service).await.unwrap();
+        let mut client = connect_retry(&format!("http://{addr}")).await.unwrap();
+        let empty_index = GameIndex::build(vec![]);
+        let manifest = empty_index.encode().unwrap();
+        let reply = client
+            .commit_version(CommitRequest {
+                game_id: 1,
+                version: 1,
+                manifest,
+                manifest_hash: empty_index.manifest_hash.to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!reply.published);
+        assert!(reply.error.contains("发布到调度中心失败"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_publish_ok() {
+        assert!(ensure_publish_ok(true, "").is_ok());
+        let err = ensure_publish_ok(false, "拒绝").unwrap_err();
+        assert!(err.to_string().contains("拒绝"));
     }
 
     #[tokio::test]

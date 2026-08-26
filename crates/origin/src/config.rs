@@ -42,6 +42,8 @@ pub struct Config {
     pub external_addr: Option<String>,
     /// relay 地址；缺省仅直连。
     pub relay_url: Option<String>,
+    /// 调度中心控制面地址（http(s)://...）；提交版本后自动发布清单。
+    pub scheduler_addr: Option<String>,
     /// 压缩触发阈值（垃圾占比 0~1）。
     #[serde(default = "default_threshold")]
     pub compact_threshold: f64,
@@ -89,6 +91,12 @@ impl Config {
         if let Some(addr) = &self.external_addr {
             addr.parse::<std::net::SocketAddr>()
                 .map_err(|_| anyhow::anyhow!("external_addr 必须是 ip:port"))?;
+        }
+        if let Some(addr) = &self.scheduler_addr
+            && !addr.starts_with("http://")
+            && !addr.starts_with("https://")
+        {
+            bail!("scheduler_addr 必须是 http(s):// 地址");
         }
         if !(0.0 < self.compact_threshold && self.compact_threshold <= 1.0) {
             bail!("compact_threshold 必须在 (0, 1] 之间");
@@ -151,6 +159,7 @@ mod tests {
         assert_eq!(config.listen_port, DEFAULT_LISTEN_PORT);
         assert_eq!(config.external_addr, None);
         assert_eq!(config.relay_url, None);
+        assert_eq!(config.scheduler_addr, None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -237,6 +246,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("external_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_scheduler_addr() {
+        let dir = std::env::temp_dir().join("blaze-origin-cfg-sched");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "data_dir = \"{}\"\nscheduler_addr = \"不合法\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("scheduler_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
