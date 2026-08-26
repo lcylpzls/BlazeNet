@@ -33,4 +33,4 @@
   - CI：`cargo fmt --check`、`cargo clippy -D warnings`、`cargo test --all-targets`、覆盖率 100% 门禁；
   - Release：打 tag 触发，构建 `bin/linux/` 与 `bin/windows/` 交付物并上传 artifacts；
   - CI 与 Release 未全绿不得合并、不得发布。
-- CI/Release 状态确认：每 30 秒轮询一次 `gh run list`/`gh run view`，不使用 `gh run watch` 长时间阻塞；未完成先汇报中间状态继续其他工作。
+- CI/Release 状态确认：每满 10 个提交查询一次 `gh run list`/`gh run view`，不使用 `gh run watch` 长时间阻塞；未完成先汇报中间状态继续其他工作。
