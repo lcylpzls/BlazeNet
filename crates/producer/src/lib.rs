@@ -1,6 +1,7 @@
 //! 制作机工具库：配置、分块、版本清单与差异计算。
 pub mod chunker;
 pub mod config;
+pub mod upload;
 
 use anyhow::{Context, Result, bail};
 use blaze_common::manifest::{FileEntry, GameIndex};
@@ -86,6 +87,47 @@ pub fn run_with_config(path: &Path) -> Result<()> {
     std::fs::write(&delta_path, serde_json::to_vec_pretty(&delta_json)?)
         .context(format!("写入差异清单失败: {}", delta_path.display()))?;
 
+    // 配置 origin_addr 时执行上传：秒传 → 流式上传 → 提交版本
+    if let Some(addr) = &config.origin_addr {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("创建异步运行时失败")?;
+        let result: anyhow::Result<upload::UploadSummary> = runtime.block_on(async {
+            let mut client =
+                blaze_proto::upload::upload_client::UploadClient::connect(addr.clone())
+                    .await
+                    .context(format!("连接原始节点失败: {addr}"))?;
+            let mut chunks = Vec::new();
+            for hash in &plan.chunks_to_download {
+                let path = stage_dir.join(format!("{}.blk", chunker::hex(hash)));
+                let data =
+                    std::fs::read(&path).context(format!("读取暂存块失败: {}", path.display()))?;
+                chunks.push((*hash, data));
+            }
+            let summary =
+                upload::upload_delta(&mut client, config.game_id, chunks, &config.origin_token)
+                    .await?;
+            upload::commit_version(
+                &mut client,
+                config.game_id,
+                config.version,
+                index.encode()?,
+                index.manifest_hash,
+                &config.origin_token,
+            )
+            .await?;
+            Ok(summary)
+        });
+        let summary = result?;
+        println!(
+            "  上传完成: 新传 {} 块，秒传跳过 {} 块，失败 {} 块",
+            summary.uploaded,
+            summary.skipped,
+            summary.failed.len()
+        );
+    }
+
     println!("制作完成: 游戏 {} 版本 {}", config.game_id, config.version);
     println!(
         "  文件数: {}，新文件: {}，更新文件: {}，删除文件: {}，差异块数: {}（{:.1}MiB）",
@@ -112,6 +154,25 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let data: Vec<u8> = (0..size).map(|_| rng.random()).collect();
         fs::write(path, data).unwrap();
+    }
+
+    fn spawn_origin(data_dir: &Path) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let url = format!("http://{addr}");
+        let dir = data_dir.to_path_buf();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let _handle = origin::server::serve(addr, origin::server::UploadService::new(dir))
+                    .await
+                    .unwrap();
+                let _ = rx.await;
+            });
+        });
+        (url, tx)
     }
 
     fn write_config(
@@ -227,5 +288,80 @@ mod tests {
     fn test_run_default_path_missing_config() {
         let path = Config::default_path().unwrap();
         assert_eq!(run().is_ok(), path.exists());
+    }
+
+    #[test]
+    fn test_run_with_config_upload() {
+        let dir = std::env::temp_dir().join("blaze-run-upload");
+        let _ = fs::remove_dir_all(&dir);
+        let server_dir = dir.join("origin-data");
+        fs::create_dir_all(&server_dir).unwrap();
+        let (url, shutdown) = spawn_origin(&server_dir);
+        let previous = dir.join("previous");
+        let source = dir.join("source");
+        let output = dir.join("output");
+        fs::create_dir_all(&previous).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        write_random(&previous.join("game.bin"), 4 * 1024 * 1024, 1);
+        let mut new_data = fs::read(previous.join("game.bin")).unwrap();
+        let mut rng = ChaCha20Rng::seed_from_u64(2);
+        new_data.extend((0..2 * 1024 * 1024).map(|_| rng.random::<u8>()));
+        fs::write(source.join("game.bin"), new_data).unwrap();
+
+        // 先发布 v1（全新游戏，全量上传）
+        let cfg_v1 = dir.join("producer-v1.toml");
+        fs::write(
+            &cfg_v1,
+            format!(
+                "game_id = 1\nversion = 1\nsource_dir = \"{}\"\noutput_dir = \"{}\"\norigin_addr = \"{}\"\n",
+                previous.display(),
+                output.display(),
+                url
+            ),
+        )
+        .unwrap();
+        run_with_config(&cfg_v1).unwrap();
+        assert!(server_dir.join("1/published/1.gameindex").exists());
+
+        // 再发布 v2（增量更新）
+        let cfg_v2 = dir.join("producer-v2.toml");
+        fs::write(
+            &cfg_v2,
+            format!(
+                "game_id = 1\nversion = 2\nsource_dir = \"{}\"\nprevious_dir = \"{}\"\noutput_dir = \"{}\"\norigin_addr = \"{}\"\n",
+                source.display(),
+                previous.display(),
+                output.display(),
+                url
+            ),
+        )
+        .unwrap();
+        run_with_config(&cfg_v2).unwrap();
+        assert!(server_dir.join("1/published/2.gameindex").exists());
+        let _ = shutdown.send(());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_run_with_config_upload_connect_failure() {
+        let dir = std::env::temp_dir().join("blaze-run-upload-fail");
+        let _ = fs::remove_dir_all(&dir);
+        let source = dir.join("source");
+        let output = dir.join("output");
+        fs::create_dir_all(&source).unwrap();
+        write_random(&source.join("a.bin"), 512 * 1024, 3);
+        let cfg_path = dir.join("producer.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                "game_id = 1\nversion = 1\nsource_dir = \"{}\"\noutput_dir = \"{}\"\norigin_addr = \"http://127.0.0.1:1\"\n",
+                source.display(),
+                output.display()
+            ),
+        )
+        .unwrap();
+        let err = run_with_config(&cfg_path).unwrap_err();
+        assert!(err.to_string().contains("连接原始节点失败"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

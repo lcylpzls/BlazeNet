@@ -50,6 +50,10 @@ pub struct Config {
     /// 上一版本完整文件目录；缺省表示全新游戏。
     pub previous_dir: Option<PathBuf>,
     pub output_dir: PathBuf,
+    /// 原始节点 gRPC 地址（如 http://127.0.0.1:50051）；缺省只生成不上传。
+    pub origin_addr: Option<String>,
+    /// 上传认证 Token；缺省不带认证头。
+    pub origin_token: Option<String>,
     #[serde(default)]
     pub chunk: ChunkParams,
 }
@@ -238,5 +242,27 @@ mod tests {
         let path = Config::default_path().unwrap();
         let text = path.to_string_lossy();
         assert!(text.ends_with(&format!("config{}producer.toml", std::path::MAIN_SEPARATOR)));
+    }
+
+    #[test]
+    fn test_load_origin_addr() {
+        let dir = std::env::temp_dir().join("blaze-cfg-origin");
+        fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("producer.toml");
+        fs::write(
+            &cfg_path,
+            format!(
+                "game_id = 1\nversion = 1\nsource_dir = \"{}\"\noutput_dir = \"/tmp/out\"\norigin_addr = \"http://127.0.0.1:50051\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&cfg_path).unwrap();
+        assert_eq!(
+            config.origin_addr.as_deref(),
+            Some("http://127.0.0.1:50051")
+        );
+        assert!(config.origin_token.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -13,11 +13,16 @@ path = "src/main.rs"
 anyhow.workspace = true
 blake3.workspace = true
 blaze-common = { path = "../blaze-common" }
+blaze-proto = { path = "../blaze-proto" }
 fastcdc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+origin = { path = "../origin" }
 rand.workspace = true
 rand_chacha.workspace = true

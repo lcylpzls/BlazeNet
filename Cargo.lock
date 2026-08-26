@@ -600,12 +600,17 @@ dependencies = [
  "anyhow",
  "blake3",
  "blaze-common",
+ "blaze-proto",
  "fastcdc",
+ "origin",
  "rand",
  "rand_chacha",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
 ]
 
 [[package]]
