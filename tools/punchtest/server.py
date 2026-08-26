@@ -29,6 +29,10 @@ def main() -> None:
                         sock.sendto(f"PEER {name_b} {b[0]}:{b[1]}".encode(), a)
                         sock.sendto(f"PEER {name_a} {a[0]}:{a[1]}".encode(), b)
                         print(f"已交换: {name_a} <-> {name_b}")
+        elif text.startswith("ECHO "):
+            name = text[5:].strip() or "node"
+            sock.sendto(f"ADDR {name} {addr[0]}:{addr[1]}".encode(), addr)
+            print(f"地址回显: {name} -> {addr[0]}:{addr[1]}")
 
 
 if __name__ == "__main__":

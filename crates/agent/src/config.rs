@@ -72,6 +72,8 @@ pub struct Config {
     pub relay_url: Option<String>,
     /// 对外通告的公网映射地址（如网吧映射/IDC 公网地址），缺省不通告。
     pub external_addr: Option<String>,
+    /// 启动期地址探测服务地址（relay 主机的 UDP 地址回显），缺省不探测。
+    pub stun_addr: Option<String>,
     /// 调度中心 gRPC 地址；缺省仅数据面。
     pub control_addr: Option<String>,
 }
@@ -132,6 +134,10 @@ impl Config {
         if let Some(addr) = &self.external_addr {
             addr.parse::<SocketAddr>()
                 .map_err(|_| anyhow::anyhow!("external_addr 必须是 ip:port"))?;
+        }
+        if let Some(addr) = &self.stun_addr {
+            addr.parse::<SocketAddr>()
+                .map_err(|_| anyhow::anyhow!("stun_addr 必须是 ip:port"))?;
         }
         if let Some(addr) = &self.control_addr
             && !addr.starts_with("http://")
@@ -316,6 +322,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("external_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_stun_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-stunbad");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\nstun_addr = \"不合法\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("stun_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 

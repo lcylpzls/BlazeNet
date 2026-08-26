@@ -3,6 +3,7 @@ pub mod config;
 pub mod control;
 pub mod datapath;
 pub mod download;
+pub mod stun;
 pub mod update;
 
 use anyhow::Result;
@@ -43,15 +44,18 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
 
 /// 启动 agent 数据面服务（主程序入口）。
 pub async fn start(config: config::Config) -> Result<AgentHandle> {
+    let external_addr = match config.external_addr.as_deref() {
+        Some(addr) => Some(addr.parse()?),
+        None => match config.stun_addr.as_deref() {
+            Some(server) => Some(stun::discover(server, config.listen_port).await?),
+            None => None,
+        },
+    };
     let handle = datapath::serve(
         config.data_dir.clone(),
         config.listen_port,
         config.relay_url.clone(),
-        config
-            .external_addr
-            .as_deref()
-            .map(str::parse)
-            .transpose()?,
+        external_addr,
     )
     .await?;
     println!(
@@ -66,12 +70,15 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
     let mut control_tasks = Vec::new();
     if let Some(addr) = &config.control_addr {
         let mut client = control::connect(addr).await?;
-        let addrs = config
-            .external_addr
-            .as_deref()
+        let addrs = external_addr
             .map(|addr| blaze_proto::control::Addr {
                 addr: addr.to_string(),
-                kind: "config".to_string(),
+                kind: if config.external_addr.is_some() {
+                    "config"
+                } else {
+                    "stun"
+                }
+                .to_string(),
                 link: String::new(),
             })
             .into_iter()
@@ -187,6 +194,7 @@ mod tests {
             listen_port: 0,
             relay_url: None,
             external_addr: Some("127.0.0.1:42001".to_string()),
+            stun_addr: None,
             control_addr: Some(url),
         })
         .await
@@ -212,11 +220,87 @@ mod tests {
             listen_port: 0,
             relay_url: None,
             external_addr: None,
+            stun_addr: None,
             control_addr: None,
         })
         .await
         .unwrap();
         handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_with_stun_discovery() {
+        // 本地地址回显服务：收到 ECHO 即回复观测地址（一次性响应）。
+        let echo =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
+        let echo_addr = echo.local_addr().unwrap().to_string();
+        let handle = echo.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let (_, src) = handle.recv_from(&mut buf).await.unwrap();
+            let reply = format!("ADDR blazenet-agent {src}");
+            let _ = handle.send_to(reply.as_bytes(), src).await;
+        });
+
+        let dir = std::env::temp_dir().join("blaze-agent-start3");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let agent = start(config::Config {
+            node_type: config::NodeType::Cafe,
+            data_dir: dir.clone(),
+            concurrent_games: 5,
+            chunk_concurrency: 4,
+            disk_free_threshold: 200 * 1024 * 1024 * 1024,
+            compact_threshold: 0.3,
+            listen_port: 0,
+            relay_url: None,
+            external_addr: None,
+            stun_addr: Some(echo_addr),
+            control_addr: None,
+        })
+        .await
+        .unwrap();
+        agent.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_with_stun_and_control() {
+        let echo =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap());
+        let echo_addr = echo.local_addr().unwrap().to_string();
+        let handle = echo.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let (_, src) = handle.recv_from(&mut buf).await.unwrap();
+            let reply = format!("ADDR blazenet-agent {src}");
+            let _ = handle.send_to(reply.as_bytes(), src).await;
+        });
+
+        let (url, _service, _handle) = scheduler_setup().await;
+        let dir = std::env::temp_dir().join("blaze-agent-start4");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let agent = start(config::Config {
+            node_type: config::NodeType::Cafe,
+            data_dir: dir.clone(),
+            concurrent_games: 5,
+            chunk_concurrency: 4,
+            disk_free_threshold: 200 * 1024 * 1024 * 1024,
+            compact_threshold: 0.3,
+            listen_port: 0,
+            relay_url: None,
+            external_addr: None,
+            stun_addr: Some(echo_addr),
+            control_addr: Some(url),
+        })
+        .await
+        .unwrap();
+        assert!(agent.port() > 0);
+        agent.shutdown();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = fs::remove_dir_all(&dir);
     }
