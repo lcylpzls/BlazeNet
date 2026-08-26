@@ -118,9 +118,9 @@ pub struct ControlService {
 }
 
 impl ControlService {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Arc<Store>) -> Self {
         Self {
-            store: Arc::new(store),
+            store,
             pending: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
         }
@@ -348,7 +348,7 @@ mod tests {
         ControlService,
     ) {
         let store = Store::open(dir).unwrap();
-        let service = ControlService::new(store);
+        let service = ControlService::new(std::sync::Arc::new(store));
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
@@ -637,7 +637,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let store = Store::open(&dir).unwrap();
-        let service = ControlService::new(store);
+        let service = ControlService::new(std::sync::Arc::new(store));
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);

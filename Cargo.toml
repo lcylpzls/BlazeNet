@@ -29,7 +29,7 @@ redb = "4.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prost = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 tokio-stream = "0.1"
 tonic = "0.14"
 tonic-prost = "0.14"

@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50051";
+/// HTTP 后台默认监听地址。
+pub const DEFAULT_HTTP_BIND_ADDR: &str = "0.0.0.0:18080";
 /// 心跳间隔默认 25 秒。
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 25;
 /// 连续 3 次心跳判定离线（75 秒）。
@@ -21,6 +23,10 @@ pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
 
 fn default_bind() -> String {
     DEFAULT_BIND_ADDR.to_string()
+}
+
+fn default_http_bind() -> String {
+    DEFAULT_HTTP_BIND_ADDR.to_string()
 }
 
 fn default_interval() -> u64 {
@@ -56,6 +62,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default = "default_bind")]
     pub bind_addr: String,
+    #[serde(default = "default_http_bind")]
+    pub http_bind_addr: String,
     #[serde(default = "default_interval")]
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_timeout")]
@@ -98,12 +106,22 @@ impl Config {
             .context(format!("bind_addr 非法: {}", self.bind_addr))
     }
 
+    /// 解析后的 HTTP 监听地址。
+    pub fn http_bind_socket_addr(&self) -> Result<SocketAddr> {
+        self.http_bind_addr
+            .parse()
+            .context(format!("http_bind_addr 非法: {}", self.http_bind_addr))
+    }
+
     fn validate(&self) -> Result<()> {
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir 不能为空");
         }
         if self.bind_socket_addr().is_err() {
             bail!("bind_addr 非法: {}", self.bind_addr);
+        }
+        if self.http_bind_socket_addr().is_err() {
+            bail!("http_bind_addr 非法: {}", self.http_bind_addr);
         }
         if self.heartbeat_interval_secs == 0 || self.offline_timeout_secs == 0 {
             bail!("心跳间隔与离线超时必须大于 0");
@@ -200,6 +218,24 @@ mod tests {
         .unwrap();
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("bind_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_http_bind() {
+        let dir = std::env::temp_dir().join("blaze-sched-cfg-http");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.toml");
+        fs::write(
+            &path,
+            format!(
+                "data_dir = \"{}\"\nhttp_bind_addr = \"不合法\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("http_bind_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 

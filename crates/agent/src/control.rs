@@ -118,7 +118,7 @@ mod tests {
         dir: &std::path::Path,
     ) -> (String, ControlService, scheduler::server::ServerHandle) {
         let store = Store::open(dir).unwrap();
-        let service = ControlService::new(store);
+        let service = ControlService::new(std::sync::Arc::new(store));
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = probe.local_addr().unwrap();
         drop(probe);
