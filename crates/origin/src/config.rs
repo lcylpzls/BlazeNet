@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.3;
 /// 默认磁盘空闲下限（50GB），低于此值拒绝新上传。
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
+/// 默认上传 gRPC 监听地址。
+pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50052";
 
 fn default_threshold() -> f64 {
     DEFAULT_COMPACT_THRESHOLD
@@ -16,10 +18,17 @@ fn default_min_free() -> u64 {
     DEFAULT_MIN_FREE_BYTES
 }
 
+fn default_bind() -> String {
+    DEFAULT_BIND_ADDR.to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// 块库根目录，每个游戏一个子目录。
     pub data_dir: PathBuf,
+    /// 上传 gRPC 监听地址。
+    #[serde(default = "default_bind")]
+    pub bind_addr: String,
     /// 压缩触发阈值（垃圾占比 0~1）。
     #[serde(default = "default_threshold")]
     pub compact_threshold: f64,
@@ -47,9 +56,19 @@ impl Config {
         Ok(config)
     }
 
+    /// 解析后的监听地址。
+    pub fn bind_socket_addr(&self) -> Result<std::net::SocketAddr> {
+        self.bind_addr
+            .parse()
+            .context(format!("bind_addr 非法: {}", self.bind_addr))
+    }
+
     fn validate(&self) -> Result<()> {
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir 不能为空");
+        }
+        if self.bind_socket_addr().is_err() {
+            bail!("bind_addr 非法: {}", self.bind_addr);
         }
         if !(0.0 < self.compact_threshold && self.compact_threshold <= 1.0) {
             bail!("compact_threshold 必须在 (0, 1] 之间");
@@ -153,6 +172,19 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("min_free_bytes"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_bind() {
+        let dir = std::env::temp_dir().join("blaze-origin-cfg-bind");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!("data_dir = \"{}\"\nbind_addr = \"不合法\"\n", dir.display()),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("bind_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
