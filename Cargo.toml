@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/blaze-proto",
     "crates/blaze-common",
+    "crates/blaze-bench",
     "crates/producer",
     "crates/origin",
     "crates/scheduler",
@@ -20,6 +21,7 @@ rust-version = "1.88"
 anyhow = "1"
 axum = "0.8"
 blake3 = "1.8"
+compio = { version = "0.19", features = ["fs", "io"] }
 fastcdc = "5.0"
 iroh = "1.0.3"
 iroh-relay = { version = "1.0.3", features = ["server", "test-utils"] }

@@ -1,17 +1,16 @@
 [package]
-name = "relay"
+name = "blaze-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "relay"
+name = "blaze-bench"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-iroh-relay.workspace = true
-serde.workspace = true
+blake3.workspace = true
+compio.workspace = true
 tokio.workspace = true
-toml.workspace = true

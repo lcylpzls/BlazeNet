@@ -19,7 +19,7 @@ jobs:
       - name: 收集 bin/linux
         run: |
           mkdir -p bin/linux
-          cp target/release/origin target/release/scheduler target/release/agent target/release/relay bin/linux/
+          cp target/release/origin target/release/scheduler target/release/agent target/release/relay target/release/blaze-bench bin/linux/
       - uses: actions/upload-artifact@v4
         with:
           name: bin-linux
