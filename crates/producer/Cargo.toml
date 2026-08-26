@@ -11,3 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
+fastcdc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
