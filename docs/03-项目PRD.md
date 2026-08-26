@@ -122,6 +122,7 @@
 ### 5.5 安全
 
 - 后台：账号密码登录，用户-场所/分组多对多绑定；
+- 后台前端：React（TypeScript）+ Vite + Ant Design 5，由调度中心托管静态资源；
 - 控制面：节点 Token + TLS（内部 CA）；
 - 数据面：iroh NodeId 身份认证；未注册节点不下发 peer 列表；
 - 内容不加密（QUIC/TLS 已加密传输）；
