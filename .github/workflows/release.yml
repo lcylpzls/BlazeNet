@@ -55,6 +55,9 @@ jobs:
       - name: 安装依赖
         working-directory: web
         run: npm ci --no-audit --no-fund
+      - name: 单元测试
+        working-directory: web
+        run: npm test
       - name: 构建
         working-directory: web
         run: npm run build

@@ -113,7 +113,12 @@ impl TaskExecutor {
             }
         }
         missing.sort();
-        self.download_missing(client, game_id, missing, |hash, data| {
+        let assigned: HashSet<[u8; 32]> = task
+            .assigned_chunks
+            .iter()
+            .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .collect();
+        self.download_missing(client, game_id, missing, &assigned, |hash, data| {
             let mut guard = store.lock().expect("块库锁不应被污染");
             guard.append_chunk(&hash, &data)?;
             Ok(())
@@ -176,6 +181,7 @@ impl TaskExecutor {
             client,
             game_id,
             plan.chunks_to_download.clone(),
+            &HashSet::new(),
             |hash, data| {
                 std::fs::write(temp_dir.join(format!("{}.blk", update::hex(&hash))), data)
                     .context("写入临时块失败")?;
@@ -194,12 +200,13 @@ impl TaskExecutor {
         Ok(())
     }
 
-    /// 多源下载：按候选 peer 分组批量拉取，无 peer 时回退原始节点。
+    /// 多源下载：按候选 peer 分组批量拉取；只有本节点责任分片内的块才允许回退原始节点。
     async fn download_missing<F>(
         &self,
         client: &mut blaze_proto::control::control_client::ControlClient<tonic::transport::Channel>,
         game_id: u64,
         missing: Vec<[u8; 32]>,
+        assigned: &HashSet<[u8; 32]>,
         mut sink: F,
     ) -> Result<Vec<[u8; 32]>>
     where
@@ -261,7 +268,15 @@ impl TaskExecutor {
         // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
         let direct_ep = fetch::build_endpoint(None).await?;
         let mut downloaded = Vec::new();
-        let mut retry: Vec<[u8; 32]> = fallback;
+        let mut retry = Vec::new();
+        let mut blocked = Vec::new();
+        for hash in fallback {
+            if assigned.contains(&hash) {
+                retry.push(hash);
+            } else {
+                blocked.push(hash);
+            }
+        }
         for (target, hashes) in groups {
             let _permit = self.source_permits.acquire().await;
             let ep = Self::choose_ep(&target, &direct_ep)?;
@@ -272,12 +287,38 @@ impl TaskExecutor {
             })
             .await
             {
-                Ok(stats) => retry.extend(stats.failed),
+                Ok(stats) => {
+                    for hash in stats.failed {
+                        if assigned.contains(&hash) {
+                            retry.push(hash);
+                        } else {
+                            blocked.push(hash);
+                        }
+                    }
+                }
                 Err(err) => {
                     println!("候选源连接失败，转入原始节点重试: {err:#}");
-                    retry.extend(hashes);
+                    for hash in hashes {
+                        if assigned.contains(&hash) {
+                            retry.push(hash);
+                        } else {
+                            blocked.push(hash);
+                        }
+                    }
                 }
             }
+        }
+        if !blocked.is_empty() {
+            if origin_target.is_none() {
+                bail!(
+                    "块无候选源且未配置原始节点: 游戏 {game_id} 缺 {} 块",
+                    blocked.len()
+                );
+            }
+            bail!(
+                "等待其他节点完成责任分片后重试: 游戏 {game_id} 缺 {} 块",
+                blocked.len()
+            );
         }
         if !retry.is_empty() {
             let Some(target) = origin_target else {
@@ -411,6 +452,52 @@ mod tests {
         (handle, vec![h1, h2])
     }
 
+    fn manifest_hashes(files: &[(&str, [u8; 32], u32)]) -> Vec<u8> {
+        let entries = files
+            .iter()
+            .map(|(name, hash, len)| FileEntry {
+                name: name.to_string(),
+                file_hash: *hash,
+                chunks: vec![ChunkMeta {
+                    hash: *hash,
+                    len: *len,
+                }],
+            })
+            .collect();
+        GameIndex::build(entries).encode().unwrap()
+    }
+
+    async fn wrong_seed_server(
+        data_dir: &Path,
+        game_id: u64,
+        hashes: &[[u8; 32]],
+    ) -> datapath::DataPathHandle {
+        let mut store = GameStore::open(data_dir, game_id).unwrap();
+        for hash in hashes {
+            store.append_chunk(hash, b"WRONG").unwrap();
+        }
+        let pack = Arc::new(StdMutex::new(store));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        pack_stores.lock().await.insert(game_id, pack.clone());
+        let data_stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        data_stores
+            .lock()
+            .await
+            .insert(game_id, NodeStore::Pack(pack));
+        datapath::serve(
+            data_stores,
+            pack_stores,
+            data_dir.to_path_buf(),
+            0,
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+    }
+
     fn config(
         node_type: NodeType,
         data_dir: PathBuf,
@@ -466,6 +553,12 @@ mod tests {
             kind: 1,
             assigned_chunks: vec![],
         }
+    }
+
+    fn assigned_task(id: u64, game_id: u64, version: u64, hashes: &[[u8; 32]]) -> Task {
+        let mut t = task(id, game_id, version);
+        t.assigned_chunks = hashes.iter().map(|h| h.to_vec()).collect();
+        t
     }
 
     #[tokio::test]
@@ -534,8 +627,12 @@ mod tests {
             ),
             1,
         );
-        exec.run_task(task(1, 1, 1)).await.unwrap();
-        exec.run_task(task(2, 1, 1)).await.unwrap();
+        exec.run_task(assigned_task(1, 1, 1, &hashes))
+            .await
+            .unwrap();
+        exec.run_task(assigned_task(2, 1, 1, &hashes))
+            .await
+            .unwrap();
 
         let local = pack_stores.lock().await.get(&1).unwrap().clone();
         {
@@ -865,7 +962,10 @@ mod tests {
             ),
             1,
         );
-        let err = exec.run_task(task(1, 1, 1)).await.unwrap_err();
+        let err = exec
+            .run_task(assigned_task(1, 1, 1, &[wrong_hash]))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("下载失败"));
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
@@ -912,12 +1012,178 @@ mod tests {
             ),
             1,
         );
-        exec.run_task(task(1, 1, 1)).await.unwrap();
+        exec.run_task(assigned_task(1, 1, 1, &hashes))
+            .await
+            .unwrap();
         let local = pack_stores.lock().await.get(&1).unwrap().clone();
         {
             let guard = local.lock().unwrap();
             assert!(guard.contains(&hashes[0]).unwrap());
         }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_idc_unassigned_chunks_wait_for_peers() {
+        let dir = std::env::temp_dir().join("blaze-exec-wait");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idc_dir = dir.join("idc");
+        let seed_dir = dir.join("seed");
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let (handle, _hashes) = seed_server(&seed_dir, 1).await;
+        let bytes = manifest(&[("a.bin", b"hello")]);
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        // 未分配中心责任且无 peer：不允许回退原始节点，等待其他节点完成分片。
+        let (exec, _data, _pack, _cafe) = executor(
+            config(
+                NodeType::Idc,
+                idc_dir,
+                url,
+                Some(handle.endpoint_id().to_string()),
+                Some(format!("127.0.0.1:{}", handle.port())),
+            ),
+            1,
+        );
+        let err = exec.run_task(task(1, 1, 1)).await.unwrap_err();
+        assert!(err.to_string().contains("等待其他节点完成责任分片"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_peer_wrong_data_partitions_assigned_and_blocked() {
+        let dir = std::env::temp_dir().join("blaze-exec-partition");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idc_dir = dir.join("idc");
+        let seed_dir = dir.join("seed");
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let handle = wrong_seed_server(&seed_dir, 1, &[h1, h2]).await;
+        let bytes = manifest_hashes(&[("a.bin", h1, 5), ("b.bin", h2, 5)]);
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "bad".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store.record_chunk_holder(2, 1, &h1).unwrap();
+        store.record_chunk_holder(2, 1, &h2).unwrap();
+        let (exec, _data, _pack, _cafe) =
+            executor(config(NodeType::Idc, idc_dir, url, None, None), 1);
+        let err = exec
+            .run_task(assigned_task(1, 1, 1, &[h1]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("无候选源"));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_assigned_peer_failed_without_origin() {
+        let dir = std::env::temp_dir().join("blaze-exec-noorigin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idc_dir = dir.join("idc");
+        let seed_dir = dir.join("seed");
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let h1 = [1u8; 32];
+        let handle = wrong_seed_server(&seed_dir, 1, &[h1]).await;
+        let bytes = manifest_hashes(&[("a.bin", h1, 5)]);
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "bad".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store.record_chunk_holder(2, 1, &h1).unwrap();
+        let (exec, _data, _pack, _cafe) =
+            executor(config(NodeType::Idc, idc_dir, url, None, None), 1);
+        let err = exec
+            .run_task(assigned_task(1, 1, 1, &[h1]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("无候选源"));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_peer_unreachable_unassigned_blocks() {
+        let dir = std::env::temp_dir().join("blaze-exec-unreach");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idc_dir = dir.join("idc");
+        let seed_dir = dir.join("seed");
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let (handle, hashes) = seed_server(&seed_dir, 1).await;
+        let bytes = manifest_hashes(&[("a.bin", hashes[0], 5), ("b.bin", hashes[1], 5)]);
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "bad".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: "127.0.0.1:1".to_string(),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store.record_chunk_holder(2, 1, &hashes[1]).unwrap();
+        let (exec, _data, _pack, _cafe) = executor(
+            config(
+                NodeType::Idc,
+                idc_dir,
+                url,
+                Some(handle.endpoint_id().to_string()),
+                Some(format!("127.0.0.1:{}", handle.port())),
+            ),
+            1,
+        );
+        let err = exec
+            .run_task(assigned_task(1, 1, 1, &[hashes[0]]))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("等待其他节点完成责任分片"));
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

@@ -11,6 +11,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
+use blaze_common::manifest::GameIndex;
+
 use crate::db::{
     AddrRecord, AuditRecord, GameRecord, GroupRecord, NodeRecord, PlaceRecord, Store, TaskRecord,
     UserRecord, hash_password,
@@ -125,6 +127,31 @@ fn bad_request() -> StatusCode {
 
 fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
+}
+
+/// IDC 任务责任分片：清单中尚无持有者的块分配给本节点从中心拉取，
+/// 已有持有者的块不分配（由该节点从 peer 拉取），保证中心出口每块一次。
+fn assign_idc_chunks(
+    store: &Store,
+    game_id: u64,
+    version: u64,
+    node_type: &str,
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+    if node_type != "idc" {
+        return Ok(Vec::new());
+    }
+    let Some(manifest) = store.get_version(game_id, version)? else {
+        return Ok(Vec::new());
+    };
+    let index = GameIndex::decode(&manifest)?;
+    let mut assigned = Vec::new();
+    for hash in index.chunk_set() {
+        if store.chunk_holders(game_id, &hash)?.is_empty() {
+            assigned.push(hash.to_vec());
+        }
+    }
+    assigned.sort();
+    Ok(assigned)
 }
 
 /// 写入审计日志（一期固定管理员身份，二期接 RBAC 会话）。
@@ -336,21 +363,23 @@ async fn create_task(
     if request.kind.is_empty() {
         return Err(bad_request());
     }
-    if state
-        .store
-        .get_node(request.node_id)
-        .map_err(store_error)?
-        .is_none()
-    {
+    let Some(node) = state.store.get_node(request.node_id).map_err(store_error)? else {
         return Err(not_found());
-    }
+    };
+    let assigned_chunks = assign_idc_chunks(
+        &state.store,
+        request.game_id,
+        request.version,
+        &node.node_type,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let task = TaskRecord {
         id: state.store.next_task_id().map_err(store_error)?,
         node_id: request.node_id,
         game_id: request.game_id,
         version: request.version,
         kind: request.kind,
-        assigned_chunks: Vec::new(),
+        assigned_chunks,
         status: "queued".to_string(),
         error: String::new(),
     };
@@ -1137,6 +1166,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_task_assigns_idc_chunks() {
+        let dir = std::env::temp_dir().join("blaze-http-assign");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (app, store) = app_with_store(&dir);
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let index =
+            blaze_common::manifest::GameIndex::build(vec![blaze_common::manifest::FileEntry {
+                name: "a.bin".to_string(),
+                file_hash: [9u8; 32],
+                chunks: vec![
+                    blaze_common::manifest::ChunkMeta { hash: h1, len: 4 },
+                    blaze_common::manifest::ChunkMeta { hash: h2, len: 4 },
+                ],
+            }]);
+        store.save_version(9, 1, &index.encode().unwrap()).unwrap();
+        for (id, node_type) in [(1u64, "idc"), (2, "idc"), (3, "cafe")] {
+            store
+                .insert_node(&NodeRecord {
+                    id,
+                    node_type: node_type.to_string(),
+                    endpoint_id: format!("ep-{id}"),
+                    token: "tok".to_string(),
+                    addrs: vec![],
+                    status: "online".to_string(),
+                    last_heartbeat_ms: 1,
+                })
+                .unwrap();
+        }
+        for node_id in [1u64, 2, 3] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/tasks")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(
+                            r#"{{"node_id":{node_id},"game_id":9,"version":1,"kind":"UPDATE"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let tasks = store.list_tasks().unwrap();
+        assert_eq!(tasks[0].assigned_chunks.len(), 2);
+        // 节点 1 完成后：节点 2 只分配尚无持有者的块。
+        store.record_chunk_holder(1, 9, &h1).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"node_id":2,"game_id":9,"version":1,"kind":"UPDATE"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let tasks = store.list_tasks().unwrap();
+        assert_eq!(tasks[3].assigned_chunks.len(), 1);
+        assert_eq!(tasks[3].assigned_chunks[0], h2.to_vec());
+        assert!(tasks[2].assigned_chunks.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

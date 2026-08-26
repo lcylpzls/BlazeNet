@@ -453,7 +453,7 @@ mod tests {
                 game_id: 1,
                 version: 1,
                 kind: "UPDATE".to_string(),
-                assigned_chunks: vec![],
+                assigned_chunks: vec![hash.to_vec()],
                 status: "queued".to_string(),
                 error: String::new(),
             })
