@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NODES: TableDefinition<u64, String> = TableDefinition::new("nodes");
@@ -551,6 +551,95 @@ impl Store {
         Ok(Some(decode(&value.value())?))
     }
 
+    /// 全部版本键值（键 `game:version`，值为清单字节的 JSON 编码）。
+    pub fn list_versions(&self) -> Result<Vec<(String, String)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn
+            .open_table(VERSIONS)
+            .context("打开 versions 表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历版本失败")? {
+            let (key, value) = item.context("读取版本项失败")?;
+            out.push((key.value(), value.value()));
+        }
+        Ok(out)
+    }
+
+    /// 全部绑定键值。
+    pub fn list_bindings(&self) -> Result<Vec<(String, u64)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(BINDINGS).context("打开绑定表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历绑定失败")? {
+            let (key, value) = item.context("读取绑定项失败")?;
+            out.push((key.value(), value.value()));
+        }
+        Ok(out)
+    }
+
+    /// 全部块账本键值（键为 game+hash，值为持有节点列表 JSON）。
+    pub fn list_chunks(&self) -> Result<Vec<(String, String)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(CHUNKS).context("打开块账本表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历块账本失败")? {
+            let (key, value) = item.context("读取块账本项失败")?;
+            out.push((key.value(), value.value()));
+        }
+        Ok(out)
+    }
+
+    /// 全部热度键值。
+    pub fn list_heat(&self) -> Result<Vec<(String, u64)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(HEAT).context("打开热度表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历热度失败")? {
+            let (key, value) = item.context("读取热度项失败")?;
+            out.push((key.value(), value.value()));
+        }
+        Ok(out)
+    }
+
+    /// 全部计数器键值。
+    pub fn list_counters(&self) -> Result<Vec<(String, u64)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(COUNTERS).context("打开计数器表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历计数器失败")? {
+            let (key, value) = item.context("读取计数器项失败")?;
+            out.push((key.value(), value.value()));
+        }
+        Ok(out)
+    }
+
+    /// 导出全库 JSON 快照到备份目录，返回快照路径。
+    pub fn backup_to(&self, dir: &Path) -> Result<PathBuf> {
+        std::fs::create_dir_all(dir).context(format!("创建备份目录失败: {}", dir.display()))?;
+        let snapshot = serde_json::json!({
+            "nodes": self.list_nodes()?,
+            "tasks": self.list_tasks()?,
+            "users": self.list_users()?,
+            "places": self.list_places()?,
+            "groups": self.list_groups()?,
+            "bindings": self.list_bindings()?,
+            "games": self.list_games()?,
+            "versions": self.list_versions()?,
+            "chunks": self.list_chunks()?,
+            "heat": self.list_heat()?,
+            "counters": self.list_counters()?,
+            "audits": self.list_audits()?,
+        });
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("scheduler-{timestamp}.json"));
+        std::fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)
+            .context(format!("写入备份失败: {}", path.display()))?;
+        Ok(path)
+    }
+
     /// 建立绑定（幂等）。
     pub fn bind(&self, kind: &str, a: u64, b: u64) -> Result<()> {
         let key = format!("{kind}/{a}/{b}");
@@ -668,6 +757,29 @@ mod tests {
         assert_eq!(audits[0].actor, "admin");
         assert_eq!(audits[0].action, "创建账号");
         assert!(audits[0].time_ms > 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_backup_to_exports_snapshot() {
+        let dir = std::env::temp_dir().join("blaze-sched-backup");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        s.add_audit("admin", "创建账号", "账号 ID 1").unwrap();
+        s.save_version(1, 1, b"v1").unwrap();
+        s.bind("user_place", 1, 2).unwrap();
+        s.add_launch(1, 3).unwrap();
+        s.record_chunk_holder(1, 1, &[7u8; 32]).unwrap();
+        let backup = dir.join("backup");
+        let path = s.backup_to(&backup).unwrap();
+        assert!(path.exists());
+        let text = fs::read_to_string(&path).unwrap();
+        for key in [
+            "nodes", "tasks", "users", "places", "groups", "bindings", "games", "versions",
+            "chunks", "heat", "counters", "audits",
+        ] {
+            assert!(text.contains(key), "备份缺少 {key}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

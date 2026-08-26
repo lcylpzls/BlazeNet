@@ -20,6 +20,8 @@ pub const DEFAULT_WEB_DIR: &str = "web";
 /// 默认管理员账号（生产必须修改）。
 pub const DEFAULT_ADMIN_USER: &str = "admin";
 pub const DEFAULT_ADMIN_PASSWORD: &str = "admin123";
+/// 默认每日备份间隔（24 小时）。
+pub const DEFAULT_BACKUP_INTERVAL_HOURS: u64 = 24;
 
 fn default_bind() -> String {
     DEFAULT_BIND_ADDR.to_string()
@@ -57,6 +59,10 @@ fn default_admin_password() -> String {
     DEFAULT_ADMIN_PASSWORD.to_string()
 }
 
+fn default_backup_interval_hours() -> u64 {
+    DEFAULT_BACKUP_INTERVAL_HOURS
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -78,6 +84,11 @@ pub struct Config {
     pub admin_user: String,
     #[serde(default = "default_admin_password")]
     pub admin_password: String,
+    /// 备份目录；缺省不启用每日备份。
+    pub backup_dir: Option<PathBuf>,
+    /// 备份间隔（小时）。
+    #[serde(default = "default_backup_interval_hours")]
+    pub backup_interval_hours: u64,
 }
 
 impl Config {
@@ -135,6 +146,9 @@ impl Config {
         if self.admin_user.is_empty() || self.admin_password.is_empty() {
             bail!("admin_user 与 admin_password 不能为空");
         }
+        if self.backup_interval_hours == 0 {
+            bail!("backup_interval_hours 必须大于 0");
+        }
         Ok(())
     }
 }
@@ -185,6 +199,8 @@ mod tests {
         assert_eq!(config.web_dir, DEFAULT_WEB_DIR);
         assert_eq!(config.admin_user, DEFAULT_ADMIN_USER);
         assert_eq!(config.admin_password, DEFAULT_ADMIN_PASSWORD);
+        assert_eq!(config.backup_dir, None);
+        assert_eq!(config.backup_interval_hours, DEFAULT_BACKUP_INTERVAL_HOURS);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -302,6 +318,24 @@ mod tests {
         .unwrap();
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("admin"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_backup_interval() {
+        let dir = std::env::temp_dir().join("blaze-sched-cfg-backup");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.toml");
+        fs::write(
+            &path,
+            format!(
+                "data_dir = \"{}\"\nbackup_interval_hours = 0\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("backup_interval_hours"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
