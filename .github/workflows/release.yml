@@ -42,9 +42,30 @@ jobs:
           name: bin-windows
           path: bin/windows
 
+  build-web:
+    name: 构建 Web 前端
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 安装依赖
+        working-directory: web
+        run: npm ci --no-audit --no-fund
+      - name: 构建
+        working-directory: web
+        run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
   release:
     name: 发布 Release
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-web]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +77,11 @@ jobs:
         with:
           name: bin-windows
           path: bin/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
       - name: 创建并上传 Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" bin/linux/* bin/windows/* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" bin/linux/* bin/windows/* web/dist/* --generate-notes
