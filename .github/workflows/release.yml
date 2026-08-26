@@ -84,4 +84,4 @@ jobs:
       - name: 创建并上传 Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" bin/linux/* bin/windows/* web/dist/* --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" bin/linux/* bin/windows/* web/dist/index.html web/dist/assets/* --generate-notes
