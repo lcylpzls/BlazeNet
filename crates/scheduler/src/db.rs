@@ -342,6 +342,16 @@ impl Store {
         Ok(values)
     }
 
+    fn delete_json(&self, table: TableDefinition<u64, String>, id: u64) -> Result<bool> {
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        let found = {
+            let mut handle = write_txn.open_table(table).context("打开表失败")?;
+            handle.remove(id).context("删除记录失败")?.is_some()
+        };
+        write_txn.commit().context("提交事务失败")?;
+        Ok(found)
+    }
+
     pub fn next_user_id(&self) -> Result<u64> {
         self.next_id(NEXT_USER_ID)
     }
@@ -372,6 +382,10 @@ impl Store {
             .collect()
     }
 
+    pub fn delete_user(&self, id: u64) -> Result<bool> {
+        self.delete_json(USERS, id)
+    }
+
     pub fn insert_place(&self, place: &PlaceRecord) -> Result<()> {
         self.insert_json(PLACES, place.id, &encode(place)?)
     }
@@ -390,6 +404,10 @@ impl Store {
             .collect()
     }
 
+    pub fn delete_place(&self, id: u64) -> Result<bool> {
+        self.delete_json(PLACES, id)
+    }
+
     pub fn insert_group(&self, group: &GroupRecord) -> Result<()> {
         self.insert_json(GROUPS, group.id, &encode(group)?)
     }
@@ -406,6 +424,10 @@ impl Store {
             .iter()
             .map(|text| decode(text))
             .collect()
+    }
+
+    pub fn delete_group(&self, id: u64) -> Result<bool> {
+        self.delete_json(GROUPS, id)
     }
 
     /// 建立绑定（幂等）。
@@ -632,6 +654,38 @@ mod tests {
         s.bind(BIND_GP, 7, 10).unwrap();
         assert_eq!(s.places_of_user(1).unwrap(), vec![10, 11, 20]);
         assert!(s.places_of_user(2).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_delete_entities() {
+        let dir = std::env::temp_dir().join("blaze-sched-del");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        let user = UserRecord {
+            id: 1,
+            username: "u".to_string(),
+            password_hash: "h".to_string(),
+            salt: "s".to_string(),
+        };
+        let place = PlaceRecord {
+            id: 1,
+            name: "p".to_string(),
+            region: "r".to_string(),
+        };
+        let group = GroupRecord {
+            id: 1,
+            name: "g".to_string(),
+        };
+        s.insert_user(&user).unwrap();
+        s.insert_place(&place).unwrap();
+        s.insert_group(&group).unwrap();
+        assert!(s.delete_user(1).unwrap());
+        assert!(!s.delete_user(1).unwrap());
+        assert!(s.delete_place(1).unwrap());
+        assert!(!s.delete_place(1).unwrap());
+        assert!(s.delete_group(1).unwrap());
+        assert!(!s.delete_group(1).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 
