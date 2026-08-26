@@ -1,20 +1,22 @@
 //! 节点 agent 库：IDC 节点（Linux）与网吧服务器（Windows）共用实现（M4/M5）。
 pub mod config;
 pub mod control;
-pub mod datapath;
 pub mod download;
 pub mod keepalive;
 pub mod stun;
 pub mod update;
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// agent 运行句柄：数据面 + 控制面任务。
 pub struct AgentHandle {
-    datapath: datapath::DataPathHandle,
+    datapath: origin::datapath::DataPathHandle,
     control_shutdown: Vec<oneshot::Sender<()>>,
     _control_tasks: Vec<JoinHandle<()>>,
 }
@@ -58,7 +60,9 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "无".to_string())
     );
-    let handle = datapath::serve(
+    let stores = Arc::new(Mutex::new(HashMap::new()));
+    let handle = origin::datapath::serve(
+        stores,
         config.data_dir.clone(),
         config.listen_port,
         config.relay_url.clone(),

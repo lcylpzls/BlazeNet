@@ -1,5 +1,7 @@
 //! 数据面块服务：iroh 自定义 ALPN，批量流式传块；relay-only 路径拒绝传块。
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use blaze_common::manifest::HASH_LEN;
@@ -7,10 +9,12 @@ use iroh::endpoint::QuicTransportConfig;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMap, RelayMode, endpoint::Connection};
 use iroh_relay::tls::CaTlsConfig;
-use origin::storage::GameStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+use crate::storage::GameStore;
 
 pub const ALPN: &[u8] = b"blazenet/1";
 
@@ -55,7 +59,11 @@ where
     }
 }
 
-async fn handle_conn(conn: Connection, data_dir: PathBuf) -> Result<()> {
+async fn handle_conn(
+    conn: Connection,
+    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    data_dir: PathBuf,
+) -> Result<()> {
     // NAT 打洞的直连路径可能延迟数秒建立，等待直连后再放行数据。
     let ready = wait_for_direct_path(
         || {
@@ -72,8 +80,14 @@ async fn handle_conn(conn: Connection, data_dir: PathBuf) -> Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi 失败")?;
     let game_id = recv.read_u64().await.context("读 game_id 失败")?;
     let count = recv.read_u32().await.context("读块数失败")?;
-    // ponytail: 并发请求暂各自打开句柄；需要时改为进程内共享句柄避免 redb 锁竞争
-    let store = GameStore::open(&data_dir, game_id)?;
+    // 与上传服务共享块库句柄，避免同一 redb 被重复打开。
+    let mut stores = stores.lock().await;
+    let store = match stores.entry(game_id) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(GameStore::open(&data_dir, game_id)?)
+        }
+    };
     for _ in 0..count {
         let mut hash = [0u8; HASH_LEN];
         recv.read_exact(&mut hash).await.context("读块哈希失败")?;
@@ -89,16 +103,22 @@ async fn handle_conn(conn: Connection, data_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn accept_loop(endpoint: Endpoint, data_dir: PathBuf, mut shutdown: oneshot::Receiver<()>) {
+async fn accept_loop(
+    endpoint: Endpoint,
+    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
+    data_dir: PathBuf,
+    mut shutdown: oneshot::Receiver<()>,
+) {
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             incoming = endpoint.accept() => {
                 let _ = incoming.map(|incoming| {
                     let data_dir = data_dir.clone();
+                    let stores = stores.clone();
                     tokio::spawn(async move {
                         if let Ok(conn) = incoming.await
-                            && let Err(err) = handle_conn(conn, data_dir).await
+                            && let Err(err) = handle_conn(conn, stores, data_dir).await
                         {
                             println!("连接处理失败: {err:#}");
                         }
@@ -137,6 +157,7 @@ impl DataPathHandle {
 
 /// 启动数据面块服务。
 pub async fn serve(
+    stores: Arc<Mutex<HashMap<u64, GameStore>>>,
     data_dir: PathBuf,
     listen_port: u16,
     relay_url: Option<String>,
@@ -172,7 +193,7 @@ pub async fn serve(
         .unwrap_or(listen_port);
     let (tx, rx) = oneshot::channel();
     let endpoint_id = endpoint.id();
-    let task = tokio::spawn(accept_loop(endpoint.clone(), data_dir, rx));
+    let task = tokio::spawn(accept_loop(endpoint.clone(), stores, data_dir, rx));
     // 等待 accept 循环就绪，避免测试/调用方立即连接失败
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     Ok(DataPathHandle {
@@ -250,9 +271,10 @@ mod tests {
         let h2 = hash_of(&d2);
         store.append_chunk(&h1, &d1).unwrap();
         store.append_chunk(&h2, &d2).unwrap();
-        drop(store);
+        let stores = Arc::new(Mutex::new(HashMap::new()));
+        stores.lock().await.insert(3, store);
 
-        let handle = serve(dir.clone(), 0, None, None).await.unwrap();
+        let handle = serve(stores, dir.clone(), 0, None, None).await.unwrap();
         let out = fetch(&handle, 3, &[h1, h2]).await.unwrap();
         assert_eq!(out, vec![d1, d2]);
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -268,7 +290,9 @@ mod tests {
         let dir = std::env::temp_dir().join("blaze-agent-dp-relay");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        let stores = Arc::new(Mutex::new(HashMap::new()));
         let handle = serve(
+            stores,
             dir.clone(),
             0,
             Some("https://127.0.0.1:1".to_string()),
@@ -283,7 +307,8 @@ mod tests {
 
         let data_file = dir.join("data-file");
         fs::write(&data_file, b"x").unwrap();
-        let handle2 = serve(data_file, 0, None, None).await.unwrap();
+        let stores2 = Arc::new(Mutex::new(HashMap::new()));
+        let handle2 = serve(stores2, data_file, 0, None, None).await.unwrap();
         assert!(fetch(&handle2, 1, &[[1u8; 32]]).await.is_err());
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle2.shutdown();

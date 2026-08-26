@@ -18,6 +18,8 @@ anyhow.workspace = true
 blake3.workspace = true
 blaze-common = { path = "../blaze-common" }
 blaze-proto = { path = "../blaze-proto" }
+iroh.workspace = true
+iroh-relay.workspace = true
 redb.workspace = true
 serde.workspace = true
 tokio.workspace = true

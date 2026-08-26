@@ -23,10 +23,12 @@ pub struct UploadService {
 
 impl UploadService {
     pub fn new(data_dir: PathBuf) -> Self {
-        Self {
-            data_dir,
-            stores: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::with_stores(data_dir, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// 与数据面共享块库句柄，避免同一 redb 被重复打开。
+    pub fn with_stores(data_dir: PathBuf, stores: Arc<Mutex<HashMap<u64, GameStore>>>) -> Self {
+        Self { data_dir, stores }
     }
 }
 

@@ -9,6 +9,8 @@ pub const DEFAULT_COMPACT_THRESHOLD: f64 = 0.3;
 pub const DEFAULT_MIN_FREE_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 /// 默认上传 gRPC 监听地址。
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50052";
+/// 默认数据面监听端口（>10000，NAT 网关打洞约束）。
+pub const DEFAULT_LISTEN_PORT: u16 = 42001;
 
 fn default_threshold() -> f64 {
     DEFAULT_COMPACT_THRESHOLD
@@ -22,6 +24,10 @@ fn default_bind() -> String {
     DEFAULT_BIND_ADDR.to_string()
 }
 
+fn default_listen_port() -> u16 {
+    DEFAULT_LISTEN_PORT
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// 块库根目录，每个游戏一个子目录。
@@ -29,6 +35,13 @@ pub struct Config {
     /// 上传 gRPC 监听地址。
     #[serde(default = "default_bind")]
     pub bind_addr: String,
+    /// 数据面 iroh 监听端口。
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    /// 对外通告的公网映射地址（原始机多 IP 时逐个登记，一期单地址）。
+    pub external_addr: Option<String>,
+    /// relay 地址；缺省仅直连。
+    pub relay_url: Option<String>,
     /// 压缩触发阈值（垃圾占比 0~1）。
     #[serde(default = "default_threshold")]
     pub compact_threshold: f64,
@@ -69,6 +82,13 @@ impl Config {
         }
         if self.bind_socket_addr().is_err() {
             bail!("bind_addr 非法: {}", self.bind_addr);
+        }
+        if self.listen_port < 10001 {
+            bail!("listen_port 必须大于 10000（NAT 网关打洞限制）");
+        }
+        if let Some(addr) = &self.external_addr {
+            addr.parse::<std::net::SocketAddr>()
+                .map_err(|_| anyhow::anyhow!("external_addr 必须是 ip:port"))?;
         }
         if !(0.0 < self.compact_threshold && self.compact_threshold <= 1.0) {
             bail!("compact_threshold 必须在 (0, 1] 之间");
@@ -128,6 +148,9 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.compact_threshold, DEFAULT_COMPACT_THRESHOLD);
         assert_eq!(config.min_free_bytes, DEFAULT_MIN_FREE_BYTES);
+        assert_eq!(config.listen_port, DEFAULT_LISTEN_PORT);
+        assert_eq!(config.external_addr, None);
+        assert_eq!(config.relay_url, None);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -185,6 +208,35 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("bind_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_listen_port() {
+        let dir = std::env::temp_dir().join("blaze-origin-cfg-port");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!("data_dir = \"{}\"\nlisten_port = 443\n", dir.display()),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("listen_port"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_external_addr() {
+        let dir = std::env::temp_dir().join("blaze-origin-cfg-ext");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "data_dir = \"{}\"\nexternal_addr = \"不合法\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("external_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
