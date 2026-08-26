@@ -144,6 +144,25 @@ impl Store {
         Ok(())
     }
 
+    /// 更新任务状态；任务不存在时返回 `false`。
+    pub fn update_task_status(&self, id: u64, status: &str, error: &str) -> Result<bool> {
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        let result = {
+            let mut table = write_txn.open_table(TASKS).context("打开 tasks 表失败")?;
+            let Some(value) = table.get(id).context("查询任务失败")? else {
+                return Ok(false);
+            };
+            let mut task: TaskRecord = decode(&value.value())?;
+            drop(value);
+            task.status = status.to_string();
+            task.error = error.to_string();
+            table.insert(id, encode(&task)?).context("更新任务失败")?;
+            true
+        };
+        write_txn.commit().context("提交任务事务失败")?;
+        Ok(result)
+    }
+
     pub fn tasks_for_node(&self, node_id: u64) -> Result<Vec<TaskRecord>> {
         let read_txn = self.db.begin_read().context("开始只读事务失败")?;
         let table = read_txn.open_table(TASKS).context("打开 tasks 表失败")?;
@@ -228,6 +247,30 @@ mod tests {
         s.insert_task(&task).unwrap();
         assert_eq!(s.tasks_for_node(7).unwrap(), vec![task.clone()]);
         assert!(s.tasks_for_node(8).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_update_task_status() {
+        let dir = std::env::temp_dir().join("blaze-sched-task-upd");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        assert_eq!(s.next_task_id().unwrap(), 1);
+        let task = TaskRecord {
+            id: 1,
+            node_id: 7,
+            game_id: 3,
+            version: 2,
+            kind: "UPDATE".to_string(),
+            assigned_chunks: vec![],
+            status: "queued".to_string(),
+            error: String::new(),
+        };
+        s.insert_task(&task).unwrap();
+        assert!(s.update_task_status(1, "ready", "").unwrap());
+        assert!(!s.update_task_status(99, "ready", "").unwrap());
+        let tasks = s.tasks_for_node(7).unwrap();
+        assert_eq!(tasks[0].status, "ready");
         let _ = fs::remove_dir_all(&dir);
     }
 

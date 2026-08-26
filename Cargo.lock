@@ -857,10 +857,14 @@ name = "scheduler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blaze-proto",
  "redb",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
 ]
 
 [[package]]

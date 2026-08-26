@@ -1,6 +1,7 @@
 //! 调度中心库：配置、数据层；控制面服务（M3 后续实现）。
 pub mod config;
 pub mod db;
+pub mod server;
 
 use anyhow::Result;
 use config::Config;

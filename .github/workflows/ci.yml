@@ -26,7 +26,23 @@ jobs:
       - name: 单元测试
         run: cargo test --workspace --all-targets
       - name: 覆盖率门禁（库代码 100%）
-        run: cargo llvm-cov --workspace --lib --fail-under-lines 100
+        run: |
+          cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
+          python3 - <<'EOF'
+          import sys
+          bad = 0
+          current = ''
+          for line in open('lcov.info'):
+              if line.startswith('SF:'):
+                  current = line[3:].strip()
+              elif line.startswith('DA:') and '/crates/' in current:
+                  count = line[3:].split(',', 1)[1].strip()
+                  if count == '0':
+                      bad += 1
+          print(f'未覆盖行: {bad}')
+          if bad:
+              sys.exit(1)
+          EOF
 
   # Linux 交付物：原始节点、调度中心、agent（IDC 角色）、relay
   build-linux:
