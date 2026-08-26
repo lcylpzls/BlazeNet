@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package blazenet.upload;
+
+// 制作机 → 原始节点：块上传、秒传查重、版本提交。
+service Upload {
+  // 秒传查重：批量查询已存在块，只上传缺失块
+  rpc QueryExistingChunks(ChunkQuery) returns (ChunkExists);
+  // 块上传：双向流，每块独立确认，失败只重传未确认块
+  rpc UploadChunks(stream UploadChunk) returns (stream UploadAck);
+  // 提交版本清单：引用块齐全且哈希一致后发布
+  rpc CommitVersion(CommitRequest) returns (CommitReply);
+}
+
+message ChunkQuery {
+  uint64 game_id = 1;
+  repeated bytes chunk_hashes = 2;
+}
+
+message ChunkExists {
+  repeated bytes existing_hashes = 1;
+}
+
+message UploadChunk {
+  uint64 game_id = 1;
+  bytes chunk_hash = 2;
+  bytes data = 3;
+  uint32 seq = 4;
+}
+
+message UploadAck {
+  bytes chunk_hash = 1;
+  bool ok = 2;
+  string error = 3;
+}
+
+message CommitRequest {
+  uint64 game_id = 1;
+  uint64 version = 2;
+  bytes manifest = 3;
+  bytes manifest_hash = 4;
+}
+
+message CommitReply {
+  bool published = 1;
+  string error = 2;
+}

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/blaze-proto",
     "crates/blaze-common",
     "crates/producer",
     "crates/origin",
@@ -24,4 +25,7 @@ rand_chacha = "0.9"
 redb = "4.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prost = "0.14"
+tonic = "0.14"
+tonic-prost = "0.14"
 toml = "0.8"
