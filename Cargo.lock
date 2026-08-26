@@ -44,13 +44,16 @@ dependencies = [
  "anyhow",
  "blake3",
  "blaze-common",
+ "blaze-proto",
  "iroh",
  "iroh-relay",
  "origin",
+ "scheduler",
  "serde",
  "tokio",
  "tokio-stream",
  "toml 0.8.23",
+ "tonic",
 ]
 
 [[package]]

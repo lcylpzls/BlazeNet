@@ -72,6 +72,8 @@ pub struct Config {
     pub relay_url: Option<String>,
     /// 对外通告的公网映射地址（如网吧映射/IDC 公网地址），缺省不通告。
     pub external_addr: Option<String>,
+    /// 调度中心 gRPC 地址；缺省仅数据面。
+    pub control_addr: Option<String>,
 }
 
 impl Config {
@@ -130,6 +132,12 @@ impl Config {
         if let Some(addr) = &self.external_addr {
             addr.parse::<SocketAddr>()
                 .map_err(|_| anyhow::anyhow!("external_addr 必须是 ip:port"))?;
+        }
+        if let Some(addr) = &self.control_addr
+            && !addr.starts_with("http://")
+            && !addr.starts_with("https://")
+        {
+            bail!("control_addr 必须是 http(s):// 地址");
         }
         Ok(())
     }
@@ -308,6 +316,41 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("external_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_control_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-ctl");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\ncontrol_addr = \"http://127.0.0.1:50051\"\n",
+                dir.display()
+            ),
+        );
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            config.control_addr.as_deref(),
+            Some("http://127.0.0.1:50051")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_control_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-ctlbad");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\ncontrol_addr = \"127.0.0.1:50051\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("control_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 
