@@ -67,7 +67,12 @@ async fn publish_to_scheduler(
 /// 连接调度中心控制面（带短重试，容忍服务启动竞态）。
 async fn connect_control(addr: &str) -> Result<ControlClient<tonic::transport::Channel>> {
     for _ in 0..30 {
-        if let Ok(client) = ControlClient::connect(addr.to_string()).await {
+        if let Ok(Ok(client)) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ControlClient::connect(addr.to_string()),
+        )
+        .await
+        {
             return Ok(client);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -243,31 +248,34 @@ impl Upload for UploadService {
         }
         let index = GameIndex::decode(&commit.manifest).map_err(decode_manifest_error)?;
 
-        let mut stores = self.stores.lock().await;
-        let store = match stores.entry(commit.game_id) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(GameStore::open(&self.data_dir, commit.game_id).map_err(open_store_error)?)
+        {
+            let mut stores = self.stores.lock().await;
+            let store = match stores.entry(commit.game_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(
+                    GameStore::open(&self.data_dir, commit.game_id).map_err(open_store_error)?,
+                ),
+            };
+            for hash in index.chunk_set() {
+                if !store.contains(&hash).map_err(query_chunk_error)? {
+                    return Ok(Response::new(CommitReply {
+                        published: false,
+                        error: "版本清单引用的块未齐全".to_string(),
+                    }));
+                }
             }
-        };
-        for hash in index.chunk_set() {
-            if !store.contains(&hash).map_err(query_chunk_error)? {
-                return Ok(Response::new(CommitReply {
-                    published: false,
-                    error: "版本清单引用的块未齐全".to_string(),
-                }));
-            }
+            let published_dir = self
+                .data_dir
+                .join(commit.game_id.to_string())
+                .join("published");
+            std::fs::create_dir_all(&published_dir).map_err(create_publish_dir_error)?;
+            std::fs::write(
+                published_dir.join(format!("{}.gameindex", commit.version)),
+                &commit.manifest,
+            )
+            .map_err(write_manifest_error)?;
         }
-        let published_dir = self
-            .data_dir
-            .join(commit.game_id.to_string())
-            .join("published");
-        std::fs::create_dir_all(&published_dir).map_err(create_publish_dir_error)?;
-        std::fs::write(
-            published_dir.join(format!("{}.gameindex", commit.version)),
-            &commit.manifest,
-        )
-        .map_err(write_manifest_error)?;
+        // 发布到调度中心属于网络调用，不持有块库锁。
         if let Some(addr) = &self.scheduler_addr
             && let Err(err) =
                 publish_to_scheduler(addr, commit.game_id, commit.version, &commit.manifest).await
