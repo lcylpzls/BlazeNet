@@ -51,6 +51,12 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
             None => None,
         },
     };
+    println!(
+        "外部地址：{}",
+        external_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "无".to_string())
+    );
     let handle = datapath::serve(
         config.data_dir.clone(),
         config.listen_port,
