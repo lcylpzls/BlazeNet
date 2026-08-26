@@ -133,6 +133,19 @@ impl GameStore {
         Ok(found)
     }
 
+    /// 返回全部索引项：(索引键, 偏移, 长度)。
+    pub fn entries(&self) -> Result<Vec<(String, u64, u32)>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(TABLE).context("打开索引表失败")?;
+        let mut out = Vec::new();
+        for item in table.iter().context("遍历索引失败")? {
+            let (key, value) = item.context("读取索引项失败")?;
+            let (offset, len) = unpack(value.value());
+            out.push((key.value(), offset, len));
+        }
+        Ok(out)
+    }
+
     /// 延迟压缩：垃圾占比达阈值且可用空间足够时整文件重写。
     /// 返回是否执行了压缩；空间不足或未达阈值时返回 `false`。
     pub fn compact(
@@ -262,6 +275,25 @@ mod tests {
         assert!(!s.contains(&h).unwrap());
         s.append_chunk(&h, b"data").unwrap();
         assert!(s.contains(&h).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_entries() {
+        let dir = std::env::temp_dir().join("blaze-store-entries");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h1 = hash(1);
+        let h2 = hash(2);
+        s.append_chunk(&h1, b"aaaa").unwrap();
+        s.append_chunk(&h2, b"bbbb").unwrap();
+        let entries = s.entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        for (key, offset, len) in &entries {
+            assert_eq!(key.len(), 80);
+            assert_eq!(*len, 4);
+            assert_eq!(*offset, if key.ends_with(&hex(&h1)) { 0 } else { 4 });
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
