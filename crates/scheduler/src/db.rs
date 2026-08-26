@@ -14,12 +14,14 @@ const USERS: TableDefinition<u64, String> = TableDefinition::new("users");
 const PLACES: TableDefinition<u64, String> = TableDefinition::new("places");
 const GROUPS: TableDefinition<u64, String> = TableDefinition::new("groups");
 const BINDINGS: TableDefinition<String, u64> = TableDefinition::new("bindings");
+const GAMES: TableDefinition<u64, String> = TableDefinition::new("games");
 
 const NEXT_NODE_ID: &str = "next_node_id";
 const NEXT_TASK_ID: &str = "next_task_id";
 const NEXT_USER_ID: &str = "next_user_id";
 const NEXT_PLACE_ID: &str = "next_place_id";
 const NEXT_GROUP_ID: &str = "next_group_id";
+const NEXT_GAME_ID: &str = "next_game_id";
 
 const BIND_UP: &str = "user_place";
 const BIND_UG: &str = "user_group";
@@ -76,6 +78,15 @@ pub struct GroupRecord {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameRecord {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub current_version: u64,
+    pub latest_version: u64,
+}
+
 /// 计算密码哈希（BLAKE3(password + salt)）。
 pub fn hash_password(password: &str, salt: &str) -> String {
     blake3::hash(format!("{salt}:{password}").as_bytes()).to_string()
@@ -104,6 +115,7 @@ fn ensure_tables(db: &Database) -> Result<()> {
     write_txn
         .open_table(BINDINGS)
         .context("创建 bindings 表失败")?;
+    write_txn.open_table(GAMES).context("创建 games 表失败")?;
     write_txn.commit().context("提交建表事务失败")?;
     Ok(())
 }
@@ -228,6 +240,18 @@ impl Store {
             if task.node_id == node_id {
                 tasks.push(task);
             }
+        }
+        Ok(tasks)
+    }
+
+    /// 全部任务列表。
+    pub fn list_tasks(&self) -> Result<Vec<TaskRecord>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(TASKS).context("打开 tasks 表失败")?;
+        let mut tasks = Vec::new();
+        for item in table.iter().context("遍历任务失败")? {
+            let (_, value) = item.context("读取任务项失败")?;
+            tasks.push(decode(&value.value())?);
         }
         Ok(tasks)
     }
@@ -364,6 +388,10 @@ impl Store {
         self.next_id(NEXT_GROUP_ID)
     }
 
+    pub fn next_game_id(&self) -> Result<u64> {
+        self.next_id(NEXT_GAME_ID)
+    }
+
     pub fn insert_user(&self, user: &UserRecord) -> Result<()> {
         self.insert_json(USERS, user.id, &encode(user)?)
     }
@@ -428,6 +456,28 @@ impl Store {
 
     pub fn delete_group(&self, id: u64) -> Result<bool> {
         self.delete_json(GROUPS, id)
+    }
+
+    pub fn insert_game(&self, game: &GameRecord) -> Result<()> {
+        self.insert_json(GAMES, game.id, &encode(game)?)
+    }
+
+    pub fn get_game(&self, id: u64) -> Result<Option<GameRecord>> {
+        let Some(text) = self.get_json(GAMES, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode(&text)?))
+    }
+
+    pub fn list_games(&self) -> Result<Vec<GameRecord>> {
+        self.list_json(GAMES)?
+            .iter()
+            .map(|text| decode(text))
+            .collect()
+    }
+
+    pub fn delete_game(&self, id: u64) -> Result<bool> {
+        self.delete_json(GAMES, id)
     }
 
     /// 建立绑定（幂等）。
@@ -686,6 +736,28 @@ mod tests {
         assert!(!s.delete_place(1).unwrap());
         assert!(s.delete_group(1).unwrap());
         assert!(!s.delete_group(1).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_games_roundtrip() {
+        let dir = std::env::temp_dir().join("blaze-sched-game");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        assert_eq!(s.next_game_id().unwrap(), 1);
+        let game = GameRecord {
+            id: 1,
+            name: "GameX".to_string(),
+            status: "published".to_string(),
+            current_version: 1,
+            latest_version: 2,
+        };
+        s.insert_game(&game).unwrap();
+        assert_eq!(s.get_game(1).unwrap(), Some(game));
+        assert_eq!(s.get_game(2).unwrap(), None);
+        assert_eq!(s.list_games().unwrap().len(), 1);
+        assert!(s.delete_game(1).unwrap());
+        assert!(!s.delete_game(1).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

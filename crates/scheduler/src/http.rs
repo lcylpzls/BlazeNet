@@ -11,7 +11,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
-use crate::db::{GroupRecord, PlaceRecord, Store, UserRecord, hash_password};
+use crate::db::{
+    AddrRecord, GameRecord, GroupRecord, NodeRecord, PlaceRecord, Store, TaskRecord, UserRecord,
+    hash_password,
+};
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -49,10 +52,38 @@ pub struct CreateGroupRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CreateGameRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct BindRequest {
     kind: String,
     a: u64,
     b: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NodeView {
+    id: u64,
+    node_type: String,
+    endpoint_id: String,
+    addrs: Vec<AddrRecord>,
+    status: String,
+    last_heartbeat_ms: u64,
+}
+
+impl From<NodeRecord> for NodeView {
+    fn from(node: NodeRecord) -> Self {
+        Self {
+            id: node.id,
+            node_type: node.node_type,
+            endpoint_id: node.endpoint_id,
+            addrs: node.addrs,
+            status: node.status,
+            last_heartbeat_ms: node.last_heartbeat_ms,
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -215,6 +246,50 @@ async fn user_places(
         .map(Json)
 }
 
+async fn list_nodes(State(state): State<HttpState>) -> Result<Json<Vec<NodeView>>, StatusCode> {
+    state
+        .store
+        .list_nodes()
+        .map_err(store_error)
+        .map(|nodes| Json(nodes.into_iter().map(NodeView::from).collect()))
+}
+
+async fn list_tasks(State(state): State<HttpState>) -> Result<Json<Vec<TaskRecord>>, StatusCode> {
+    state.store.list_tasks().map_err(store_error).map(Json)
+}
+
+async fn list_games(State(state): State<HttpState>) -> Result<Json<Vec<GameRecord>>, StatusCode> {
+    state.store.list_games().map_err(store_error).map(Json)
+}
+
+async fn create_game(
+    State(state): State<HttpState>,
+    Json(request): Json<CreateGameRequest>,
+) -> Result<Json<GameRecord>, StatusCode> {
+    if request.name.is_empty() {
+        return Err(bad_request());
+    }
+    let game = GameRecord {
+        id: state.store.next_game_id().map_err(store_error)?,
+        name: request.name,
+        status: "uploading".to_string(),
+        current_version: 0,
+        latest_version: 0,
+    };
+    state.store.insert_game(&game).map_err(store_error)?;
+    Ok(Json(game))
+}
+
+async fn delete_game(
+    State(state): State<HttpState>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, StatusCode> {
+    if !state.store.delete_game(id).map_err(store_error)? {
+        return Err(not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 构建 HTTP 路由：静态资源 + 健康检查 + 登录。
 pub fn router(
     web_dir: PathBuf,
@@ -232,6 +307,10 @@ pub fn router(
         .route("/api/places/{id}", delete(delete_place))
         .route("/api/groups", get(list_groups).post(create_group))
         .route("/api/groups/{id}", delete(delete_group))
+        .route("/api/nodes", get(list_nodes))
+        .route("/api/tasks", get(list_tasks))
+        .route("/api/games", get(list_games).post(create_game))
+        .route("/api/games/{id}", delete(delete_game))
         .route("/api/bindings", post(bind))
         .fallback_service(ServeDir::new(web_dir))
         .with_state(HttpState {
@@ -567,5 +646,104 @@ mod tests {
         );
         assert_eq!(bad_request(), StatusCode::BAD_REQUEST);
         assert_eq!(not_found(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_nodes_tasks_games_api() {
+        let dir = std::env::temp_dir().join("blaze-http-ngt");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("data")).unwrap());
+        store
+            .insert_node(&crate::db::NodeRecord {
+                id: 1,
+                node_type: "idc".to_string(),
+                endpoint_id: "ep".to_string(),
+                token: "secret".to_string(),
+                addrs: vec![crate::db::AddrRecord {
+                    addr: "127.0.0.1:42001".to_string(),
+                    kind: "config".to_string(),
+                    link: "".to_string(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store
+            .insert_task(&crate::db::TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .unwrap();
+        let app = router(
+            dir.clone(),
+            "admin".to_string(),
+            "secret".to_string(),
+            store,
+        );
+        for uri in ["/api/nodes", "/api/tasks", "/api/games"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"GameX"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":""}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/games/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/games/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
