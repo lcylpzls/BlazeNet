@@ -142,6 +142,10 @@ name = "origin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blaze-common",
+ "redb",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -219,6 +223,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

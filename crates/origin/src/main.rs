@@ -1,5 +1,6 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    origin::run()
+    let args: Vec<String> = std::env::args().collect();
+    origin::run_from_args(&args)
 }
