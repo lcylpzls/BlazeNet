@@ -68,6 +68,8 @@ pub struct Config {
     pub compact_threshold: f64,
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
+    /// 保活 pong 应答端口（独立 UDP，须可入站），缺省不启用。
+    pub keepalive_port: Option<u16>,
     /// relay 地址；缺省仅直连。
     pub relay_url: Option<String>,
     /// 对外通告的公网映射地址（如网吧映射/IDC 公网地址），缺省不通告。
@@ -130,6 +132,11 @@ impl Config {
         }
         if self.listen_port < 10001 {
             bail!("listen_port 必须大于 10000（NAT 网关打洞限制）");
+        }
+        if let Some(port) = self.keepalive_port
+            && port < 10001
+        {
+            bail!("keepalive_port 必须大于 10000（NAT 网关打洞限制）");
         }
         if let Some(addr) = &self.external_addr {
             addr.parse::<SocketAddr>()
@@ -338,6 +345,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("stun_addr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_keepalive_port() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-kap");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\nkeepalive_port = 443\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("keepalive_port"));
         let _ = fs::remove_dir_all(&dir);
     }
 

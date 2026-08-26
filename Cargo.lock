@@ -3395,6 +3395,7 @@ dependencies = [
  "anyhow",
  "axum",
  "blake3",
+ "blaze-common",
  "blaze-proto",
  "redb",
  "serde",

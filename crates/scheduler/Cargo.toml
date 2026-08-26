@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 blake3.workspace = true
+blaze-common = { path = "../blaze-common" }
 blaze-proto = { path = "../blaze-proto" }
 redb.workspace = true
 serde.workspace = true

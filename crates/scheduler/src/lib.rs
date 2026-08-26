@@ -39,6 +39,20 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
     .await
     .context("启动控制面 gRPC 服务失败")?;
 
+    let keepalive_socket = Arc::new(
+        tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("绑定保活 UDP 端口失败")?,
+    );
+    let (keepalive_tx, keepalive_rx) = tokio::sync::oneshot::channel();
+    let keepalive_task = tokio::spawn(keepalive::run(
+        store.clone(),
+        keepalive_socket,
+        config.keepalive_interval_secs,
+        config.keepalive_fail_threshold,
+        keepalive_rx,
+    ));
+
     let listener = TcpListener::bind(config.http_bind_socket_addr()?)
         .await
         .context("绑定 HTTP 端口失败")?;
@@ -59,6 +73,8 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
 
     println!("调度中心服务就绪，等待停止信号...");
     stop.await;
+    let _ = keepalive_tx.send(());
+    let _ = keepalive_task.await;
     let _ = http_tx.send(());
     let _ = http_task.await;
     drop(grpc_handle);
@@ -118,7 +134,7 @@ mod tests {
             admin_user: "admin".to_string(),
             admin_password: "admin123".to_string(),
         };
-        fs::create_dir_all(&config.web_dir.clone()).unwrap();
+        fs::create_dir_all(config.web_dir.clone()).unwrap();
         let (tx, rx) = oneshot::channel();
         let task = tokio::spawn(run(config, async move {
             let _ = rx.await;

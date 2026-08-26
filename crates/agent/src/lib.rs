@@ -3,6 +3,7 @@ pub mod config;
 pub mod control;
 pub mod datapath;
 pub mod download;
+pub mod keepalive;
 pub mod stun;
 pub mod update;
 
@@ -74,6 +75,13 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
     );
     let mut control_shutdown = Vec::new();
     let mut control_tasks = Vec::new();
+    if let Some(port) = config.keepalive_port {
+        let (tx, rx) = oneshot::channel();
+        control_tasks.push(tokio::spawn(async move {
+            let _ = keepalive::serve_pong(port, rx).await;
+        }));
+        control_shutdown.push(tx);
+    }
     if let Some(addr) = &config.control_addr {
         let mut client = control::connect(addr).await?;
         let addrs = external_addr
@@ -198,6 +206,7 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            keepalive_port: None,
             relay_url: None,
             external_addr: Some("127.0.0.1:42001".to_string()),
             stun_addr: None,
@@ -224,6 +233,7 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            keepalive_port: None,
             relay_url: None,
             external_addr: None,
             stun_addr: None,
@@ -261,6 +271,7 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            keepalive_port: Some(0),
             relay_url: None,
             external_addr: None,
             stun_addr: Some(echo_addr),
@@ -298,6 +309,7 @@ mod tests {
             disk_free_threshold: 200 * 1024 * 1024 * 1024,
             compact_threshold: 0.3,
             listen_port: 0,
+            keepalive_port: None,
             relay_url: None,
             external_addr: None,
             stun_addr: Some(echo_addr),
