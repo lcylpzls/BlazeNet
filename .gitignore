@@ -1,0 +1,22 @@
+# Rust 构建产物
+target/
+
+# 编译交付物（bin/ 只保留目录结构，产物不入库）
+bin/linux/*
+bin/windows/*
+!bin/linux/.gitkeep
+!bin/windows/.gitkeep
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 环境与密钥
+.env
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/

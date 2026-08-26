@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["chunker", "netpoc"]
+
+[workspace.package]
+edition = "2024"
+license = "Proprietary"

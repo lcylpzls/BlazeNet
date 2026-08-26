@@ -1,0 +1,13 @@
+[package]
+name = "netpoc"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.8"
+iroh = "1.0.3"
+iroh-relay = { version = "1.0.3", features = ["server", "test-utils"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
