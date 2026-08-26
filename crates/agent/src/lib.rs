@@ -24,6 +24,11 @@ pub async fn start(config: config::Config) -> Result<datapath::DataPathHandle> {
         config.data_dir.clone(),
         config.listen_port,
         config.relay_url.clone(),
+        config
+            .external_addr
+            .as_deref()
+            .map(str::parse)
+            .transpose()?,
     )
     .await?;
     println!(
@@ -95,6 +100,7 @@ mod tests {
             compact_threshold: 0.3,
             listen_port: 0,
             relay_url: None,
+            external_addr: None,
         })
         .await
         .unwrap();

@@ -1,6 +1,7 @@
 //! agent 配置：Linux 唯一参数 `--config`；Windows 自动读取程序目录上一级 `config/` 下固定文件名。
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Windows 固定配置文件名（写死在代码中）。
@@ -69,6 +70,8 @@ pub struct Config {
     pub listen_port: u16,
     /// relay 地址；缺省仅直连。
     pub relay_url: Option<String>,
+    /// 对外通告的公网映射地址（如网吧映射/IDC 公网地址），缺省不通告。
+    pub external_addr: Option<String>,
 }
 
 impl Config {
@@ -123,6 +126,10 @@ impl Config {
         }
         if self.listen_port < 10001 {
             bail!("listen_port 必须大于 10000（NAT 网关打洞限制）");
+        }
+        if let Some(addr) = &self.external_addr {
+            addr.parse::<SocketAddr>()
+                .map_err(|_| anyhow::anyhow!("external_addr 必须是 ip:port"))?;
         }
         Ok(())
     }
@@ -269,6 +276,38 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("10000"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_external_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-ext");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\nexternal_addr = \"111.161.74.28:42001\"\n",
+                dir.display()
+            ),
+        );
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.external_addr.as_deref(), Some("111.161.74.28:42001"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_external_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-extbad");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\nexternal_addr = \"不合法\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("external_addr"));
         let _ = fs::remove_dir_all(&dir);
     }
 

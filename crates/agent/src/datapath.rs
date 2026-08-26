@@ -103,12 +103,16 @@ pub async fn serve(
     data_dir: PathBuf,
     listen_port: u16,
     relay_url: Option<String>,
+    external_addr: Option<std::net::SocketAddr>,
 ) -> Result<DataPathHandle> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
         .clear_ip_transports()
         .bind_addr(format!("0.0.0.0:{listen_port}"))?;
+    if let Some(addr) = external_addr {
+        builder = builder.external_addr(addr);
+    }
     if let Some(url) = relay_url {
         let relay_url: iroh::RelayUrl = url.parse()?;
         builder = builder
@@ -205,7 +209,7 @@ mod tests {
         store.append_chunk(&h2, &d2).unwrap();
         drop(store);
 
-        let handle = serve(dir.clone(), 0, None).await.unwrap();
+        let handle = serve(dir.clone(), 0, None, None).await.unwrap();
         let out = fetch(&handle, 3, &[h1, h2]).await.unwrap();
         assert_eq!(out, vec![d1, d2]);
         tokio::time::sleep(Duration::from_millis(700)).await;
@@ -221,9 +225,14 @@ mod tests {
         let dir = std::env::temp_dir().join("blaze-agent-dp-relay");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let handle = serve(dir.clone(), 0, Some("https://127.0.0.1:1".to_string()))
-            .await
-            .unwrap();
+        let handle = serve(
+            dir.clone(),
+            0,
+            Some("https://127.0.0.1:1".to_string()),
+            Some("127.0.0.1:42001".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         assert!(fetch(&handle, 1, &[]).await.is_ok());
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
@@ -231,7 +240,7 @@ mod tests {
 
         let data_file = dir.join("data-file");
         fs::write(&data_file, b"x").unwrap();
-        let handle2 = serve(data_file, 0, None).await.unwrap();
+        let handle2 = serve(data_file, 0, None, None).await.unwrap();
         assert!(fetch(&handle2, 1, &[[1u8; 32]]).await.is_err());
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle2.shutdown();
