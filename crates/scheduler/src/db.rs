@@ -7,6 +7,8 @@ use std::path::Path;
 const NODES: TableDefinition<u64, String> = TableDefinition::new("nodes");
 const TASKS: TableDefinition<u64, String> = TableDefinition::new("tasks");
 const COUNTERS: TableDefinition<String, u64> = TableDefinition::new("counters");
+const CHUNKS: TableDefinition<String, String> = TableDefinition::new("chunks");
+const HEAT: TableDefinition<String, u64> = TableDefinition::new("heat");
 
 const NEXT_NODE_ID: &str = "next_node_id";
 const NEXT_TASK_ID: &str = "next_task_id";
@@ -56,8 +58,17 @@ fn ensure_tables(db: &Database) -> Result<()> {
     write_txn
         .open_table(COUNTERS)
         .context("创建 counters 表失败")?;
+    write_txn.open_table(CHUNKS).context("创建 chunks 表失败")?;
+    write_txn.open_table(HEAT).context("创建 heat 表失败")?;
     write_txn.commit().context("提交建表事务失败")?;
     Ok(())
+}
+
+fn chunk_key(game_id: u64, hash: &[u8]) -> String {
+    format!(
+        "{game_id:016x}{}",
+        hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
 }
 
 /// 调度中心数据存储。
@@ -186,6 +197,77 @@ impl Store {
             .map(|n| n.id)
             .collect())
     }
+
+    /// 记录节点持有某块（幂等）。
+    pub fn record_chunk_holder(&self, node_id: u64, game_id: u64, hash: &[u8]) -> Result<()> {
+        let key = chunk_key(game_id, hash);
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        {
+            let mut table = write_txn.open_table(CHUNKS).context("打开 chunks 表失败")?;
+            let mut holders: Vec<u64> = table
+                .get(key.clone())
+                .context("查询块账本失败")?
+                .map(|v| {
+                    let text = v.value();
+                    serde_json::from_str(&text).unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !holders.contains(&node_id) {
+                holders.push(node_id);
+                table
+                    .insert(key, encode(&holders)?)
+                    .context("写入块账本失败")?;
+            }
+        }
+        write_txn.commit().context("提交块账本事务失败")?;
+        Ok(())
+    }
+
+    /// 查询某块的持有节点。
+    pub fn chunk_holders(&self, game_id: u64, hash: &[u8]) -> Result<Vec<u64>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(CHUNKS).context("打开 chunks 表失败")?;
+        let Some(value) = table
+            .get(chunk_key(game_id, hash))
+            .context("查询块账本失败")?
+        else {
+            return Ok(Vec::new());
+        };
+        let holders: Vec<u64> = serde_json::from_str(&value.value()).context("解析块账本失败")?;
+        Ok(holders)
+    }
+
+    /// 增加游戏启动次数（热度 mock 输入）。
+    pub fn add_launch(&self, game_id: u64, count: u64) -> Result<u64> {
+        let key = game_id.to_string();
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        let total = {
+            let mut table = write_txn.open_table(HEAT).context("打开 heat 表失败")?;
+            let next = table
+                .get(key.clone())
+                .context("读取热度失败")?
+                .map(|v| v.value() + count)
+                .unwrap_or(count);
+            table.insert(key, next).context("写入热度失败")?;
+            next
+        };
+        write_txn.commit().context("提交热度事务失败")?;
+        Ok(total)
+    }
+
+    /// 按热度降序返回游戏 ID 列表。
+    pub fn top_games(&self, limit: usize) -> Result<Vec<u64>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(HEAT).context("打开 heat 表失败")?;
+        let mut games: Vec<(u64, u64)> = Vec::new();
+        for item in table.iter().context("遍历热度失败")? {
+            let (key, value) = item.context("读取热度项失败")?;
+            let game_id = key.value().parse().context("解析游戏 ID 失败")?;
+            games.push((game_id, value.value()));
+        }
+        games.sort_by_key(|a| std::cmp::Reverse(a.1));
+        Ok(games.into_iter().take(limit).map(|(id, _)| id).collect())
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +365,33 @@ mod tests {
         s.insert_node(&node(2, 10_000)).unwrap();
         let offline = s.offline_nodes(11_000, 5_000).unwrap();
         assert_eq!(offline, vec![1]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_chunk_ledger() {
+        let dir = std::env::temp_dir().join("blaze-sched-ledger");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        let hash = [7u8; 32];
+        s.record_chunk_holder(1, 3, &hash).unwrap();
+        s.record_chunk_holder(2, 3, &hash).unwrap();
+        s.record_chunk_holder(1, 3, &hash).unwrap();
+        assert_eq!(s.chunk_holders(3, &hash).unwrap(), vec![1, 2]);
+        assert!(s.chunk_holders(3, &[8u8; 32]).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_heat_top_games() {
+        let dir = std::env::temp_dir().join("blaze-sched-heat");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        s.add_launch(1, 5).unwrap();
+        s.add_launch(2, 9).unwrap();
+        s.add_launch(1, 3).unwrap();
+        assert_eq!(s.top_games(10).unwrap(), vec![2, 1]);
+        assert_eq!(s.top_games(1).unwrap(), vec![2]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -12,6 +12,8 @@ service Control {
   rpc WatchTasks(TaskFilter) returns (stream TaskEvent);
   // 任务状态上报
   rpc ReportTask(TaskReport) returns (Empty);
+  // 块完成上报：更新块账本
+  rpc ReportChunk(ChunkDone) returns (Empty);
   // 查询候选源（含多 IP 地址）
   rpc QueryPeers(PeerQuery) returns (PeerList);
   // 查询版本清单
@@ -75,6 +77,13 @@ message TaskReport {
   uint64 task_id = 2;
   string status = 3;
   string error = 4;
+}
+
+message ChunkDone {
+  uint64 node_id = 1;
+  uint64 game_id = 2;
+  bytes chunk_hash = 3;
+  uint32 size = 4;
 }
 
 message PeerQuery {

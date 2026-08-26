@@ -6,8 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use blaze_proto::control::control_server::Control;
 use blaze_proto::control::{
-    Empty, HeartbeatReply, HeartbeatRequest, PeerList, PeerQuery, RegisterReply, RegisterRequest,
-    Task, TaskEvent, TaskFilter, TaskReport, VersionInfo, VersionQuery, task_event,
+    Addr, ChunkDone, Empty, HeartbeatReply, HeartbeatRequest, Peer, PeerList, PeerQuery,
+    RegisterReply, RegisterRequest, Task, TaskEvent, TaskFilter, TaskReport, VersionInfo,
+    VersionQuery, task_event,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio_stream::wrappers::ReceiverStream;
@@ -75,6 +76,10 @@ fn update_node_error(err: anyhow::Error) -> Status {
 
 fn update_task_error(err: anyhow::Error) -> Status {
     Status::internal(format!("更新任务失败: {err}"))
+}
+
+fn chunk_ledger_error(err: anyhow::Error) -> Status {
+    Status::internal(format!("块账本操作失败: {err}"))
 }
 
 /// 任务流推送循环：发送待推送事件，空闲时等待通知或超时。
@@ -234,11 +239,46 @@ impl Control for ControlService {
         Ok(Response::new(Empty {}))
     }
 
-    async fn query_peers(
-        &self,
-        _request: Request<PeerQuery>,
-    ) -> Result<Response<PeerList>, Status> {
-        Ok(Response::new(PeerList { peers: vec![] }))
+    async fn report_chunk(&self, request: Request<ChunkDone>) -> Result<Response<Empty>, Status> {
+        let done = request.into_inner();
+        self.store
+            .record_chunk_holder(done.node_id, done.game_id, &done.chunk_hash)
+            .map_err(chunk_ledger_error)?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn query_peers(&self, request: Request<PeerQuery>) -> Result<Response<PeerList>, Status> {
+        let query = request.into_inner();
+        let holders = self
+            .store
+            .chunk_holders(query.game_id, &query.chunk_hash)
+            .map_err(chunk_ledger_error)?;
+        let limit = if query.limit == 0 {
+            usize::MAX
+        } else {
+            query.limit as usize
+        };
+        let mut peers = Vec::new();
+        for id in holders.into_iter().take(limit) {
+            let Some(node) = self.store.get_node(id).map_err(query_node_error)? else {
+                continue;
+            };
+            peers.push(Peer {
+                node_id: node.id,
+                endpoint_id: node.endpoint_id,
+                addrs: node
+                    .addrs
+                    .into_iter()
+                    .map(|a| Addr {
+                        addr: a.addr,
+                        kind: a.kind,
+                        link: a.link,
+                    })
+                    .collect(),
+                direct_only: node.node_type == "cafe",
+            });
+        }
+        Ok(Response::new(PeerList { peers }))
     }
 
     async fn get_version(
@@ -283,7 +323,9 @@ pub async fn serve(addr: std::net::SocketAddr, service: ControlService) -> Resul
 mod tests {
     use super::*;
     use blaze_proto::control::control_client::ControlClient;
-    use blaze_proto::control::{Addr, HeartbeatRequest, RegisterRequest, TaskFilter, TaskReport};
+    use blaze_proto::control::{
+        Addr, ChunkDone, HeartbeatRequest, RegisterRequest, TaskFilter, TaskReport,
+    };
     use std::fs;
     use std::time::Duration;
     use tokio_stream::StreamExt;
@@ -412,6 +454,40 @@ mod tests {
         let (mut client, _handle, service) = setup(&dir).await;
         service.push_task(task_record(1, 7)).await.unwrap();
         client
+            .register(RegisterRequest {
+                node_type: "idc".to_string(),
+                endpoint_id: "ep-1".to_string(),
+                addrs: vec![Addr {
+                    addr: "127.0.0.1:42001".to_string(),
+                    kind: "config".to_string(),
+                    link: "".to_string(),
+                }],
+                token: String::new(),
+            })
+            .await
+            .unwrap();
+        client
+            .register(RegisterRequest {
+                node_type: "cafe".to_string(),
+                endpoint_id: "ep-2".to_string(),
+                addrs: vec![],
+                token: String::new(),
+            })
+            .await
+            .unwrap();
+        let hash = vec![7u8; 32];
+        for node_id in [1u64, 2, 99] {
+            client
+                .report_chunk(ChunkDone {
+                    node_id,
+                    game_id: 3,
+                    chunk_hash: hash.clone(),
+                    size: 4,
+                })
+                .await
+                .unwrap();
+        }
+        client
             .report_task(TaskReport {
                 node_id: 7,
                 task_id: 1,
@@ -423,13 +499,35 @@ mod tests {
         let peers = client
             .query_peers(blaze_proto::control::PeerQuery {
                 game_id: 1,
-                chunk_hash: vec![],
+                chunk_hash: vec![8u8; 32],
                 limit: 0,
             })
             .await
             .unwrap()
             .into_inner();
         assert!(peers.peers.is_empty());
+        let peers = client
+            .query_peers(blaze_proto::control::PeerQuery {
+                game_id: 3,
+                chunk_hash: hash.clone(),
+                limit: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(peers.peers.len(), 2);
+        assert_eq!(peers.peers[0].addrs.len(), 1);
+        assert!(peers.peers.iter().any(|p| p.direct_only));
+        let peers = client
+            .query_peers(blaze_proto::control::PeerQuery {
+                game_id: 3,
+                chunk_hash: hash,
+                limit: 1,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(peers.peers.len(), 1);
         let version = client
             .get_version(blaze_proto::control::VersionQuery {
                 game_id: 1,
@@ -597,6 +695,11 @@ mod tests {
             update_task_error(anyhow::anyhow!("x"))
                 .message()
                 .contains("更新任务失败")
+        );
+        assert!(
+            chunk_ledger_error(anyhow::anyhow!("x"))
+                .message()
+                .contains("块账本操作失败")
         );
     }
 }
