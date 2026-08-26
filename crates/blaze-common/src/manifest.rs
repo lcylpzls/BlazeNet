@@ -3,11 +3,16 @@
 use anyhow::{Result, bail};
 use std::io::{Cursor, Read};
 
-use crate::chunker::ChunkMeta;
-
 pub const MAGIC: &[u8; 5] = b"BLZGI";
 pub const FORMAT_VERSION: u16 = 1;
 pub const HASH_LEN: usize = 32;
+
+/// 单个块的元信息（不含数据本体）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMeta {
+    pub hash: [u8; HASH_LEN],
+    pub len: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -201,15 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_set_dedup() {
-        let index = GameIndex::build(vec![
-            entry("a.bin", vec![(1, 10), (2, 20)]),
-            entry("b.bin", vec![(1, 10), (3, 30)]),
-        ]);
-        assert_eq!(index.chunk_set().len(), 3);
-    }
-
-    #[test]
     fn test_decode_invalid_utf8_name() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC);
@@ -234,5 +230,14 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 4]);
         let err = GameIndex::decode(&bytes).unwrap_err();
         assert!(err.to_string().contains("多余数据"));
+    }
+
+    #[test]
+    fn test_chunk_set_dedup() {
+        let index = GameIndex::build(vec![
+            entry("a.bin", vec![(1, 10), (2, 20)]),
+            entry("b.bin", vec![(1, 10), (3, 30)]),
+        ]);
+        assert_eq!(index.chunk_set().len(), 3);
     }
 }

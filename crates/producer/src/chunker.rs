@@ -6,14 +6,9 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-use crate::config::ChunkParams;
+use blaze_common::manifest::ChunkMeta;
 
-/// 单个块的元信息（数据不上屏，按需从源文件偏移读取或从暂存区读取）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkMeta {
-    pub hash: [u8; 32],
-    pub len: u32,
-}
+use crate::config::ChunkParams;
 
 /// 计算文件内容的 BLAKE3 哈希（流式，避免整文件载入内存）。
 pub fn file_hash(path: &Path) -> Result<[u8; 32]> {

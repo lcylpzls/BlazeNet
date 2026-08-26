@@ -1,15 +1,14 @@
 //! 制作机工具库：配置、分块、版本清单与差异计算。
 pub mod chunker;
 pub mod config;
-pub mod delta;
-pub mod manifest;
 
 use anyhow::{Context, Result, bail};
+use blaze_common::manifest::{FileEntry, GameIndex};
+use blaze_common::update_plan;
 use std::collections::HashSet;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::manifest::{FileEntry, GameIndex};
 
 /// 程序入口：按 Windows 规范自动定位配置文件后执行。
 pub fn run() -> Result<()> {
@@ -72,14 +71,16 @@ pub fn run_with_config(path: &Path) -> Result<()> {
         _ => None,
     };
 
-    let plan = delta::compute(&index, old.as_ref());
+    let plan = update_plan::compute(&index, old.as_ref(), &HashSet::new());
     let delta_json = serde_json::json!({
         "game_id": config.game_id,
         "version": config.version,
-        "new_chunk_count": plan.new_chunks.len(),
-        "new_bytes": plan.new_bytes,
-        "reused_chunk_count": plan.reused_chunks,
-        "chunk_hashes": plan.new_chunks.iter().map(|h| chunker::hex(h)).collect::<Vec<_>>(),
+        "files_to_download_count": plan.files_to_download.len(),
+        "files_to_update_count": plan.files_to_update.len(),
+        "files_to_delete_count": plan.files_to_delete.len(),
+        "new_chunk_count": plan.chunks_to_download.len(),
+        "new_bytes": plan.download_bytes,
+        "chunk_hashes": plan.chunks_to_download.iter().map(|h| chunker::hex(h)).collect::<Vec<_>>(),
     });
     let delta_path = delta_dir.join(format!("{}.json", config.version));
     std::fs::write(&delta_path, serde_json::to_vec_pretty(&delta_json)?)
@@ -87,11 +88,13 @@ pub fn run_with_config(path: &Path) -> Result<()> {
 
     println!("制作完成: 游戏 {} 版本 {}", config.game_id, config.version);
     println!(
-        "  文件数: {}，差异块数: {}（{:.1}MiB），复用块数: {}",
+        "  文件数: {}，新文件: {}，更新文件: {}，删除文件: {}，差异块数: {}（{:.1}MiB）",
         files.len(),
-        plan.new_chunks.len(),
-        plan.new_bytes as f64 / 1024.0 / 1024.0,
-        plan.reused_chunks
+        plan.files_to_download.len(),
+        plan.files_to_update.len(),
+        plan.files_to_delete.len(),
+        plan.chunks_to_download.len(),
+        plan.download_bytes as f64 / 1024.0 / 1024.0,
     );
     println!("  版本清单: {}", index_path.display());
     println!("  差异清单: {}", delta_path.display());
@@ -154,7 +157,9 @@ mod tests {
         let delta: serde_json::Value =
             serde_json::from_slice(&fs::read(&delta_path).unwrap()).unwrap();
         assert!(delta["new_chunk_count"].as_u64().unwrap() > 0);
-        assert!(delta["reused_chunk_count"].as_u64().unwrap() > 0);
+        assert_eq!(delta["files_to_update_count"].as_u64().unwrap(), 1);
+        assert_eq!(delta["files_to_download_count"].as_u64().unwrap(), 0);
+        assert_eq!(delta["files_to_delete_count"].as_u64().unwrap(), 0);
         assert!(
             !fs::read_dir(output.join("chunks"))
                 .unwrap()
@@ -213,7 +218,8 @@ mod tests {
         run_with_config(&cfg_path).unwrap();
         let delta: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("delta/1.json")).unwrap()).unwrap();
-        assert_eq!(delta["reused_chunk_count"].as_u64().unwrap(), 0);
+        assert_eq!(delta["files_to_download_count"].as_u64().unwrap(), 1);
+        assert_eq!(delta["files_to_update_count"].as_u64().unwrap(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
