@@ -4,6 +4,7 @@ use blaze_proto::upload::upload_client::UploadClient;
 use blaze_proto::upload::{ChunkQuery, CommitRequest, UploadChunk};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -102,19 +103,29 @@ pub async fn upload_delta(
         }
     }
     let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let read_failures = Arc::new(StdMutex::new(Vec::new()));
+    let failures = read_failures.clone();
     let _task = tokio::spawn(async move {
         for (seq, hash) in missing.iter().enumerate() {
             let path = stage.join(format!("{}.blk", hex(hash)));
-            // 已预检存在；读取异常时该块缺失，提交阶段会因缺块失败兜底。
-            if let Ok(data) = tokio::fs::read(&path).await {
-                let _ = tx
-                    .send(UploadChunk {
-                        game_id,
-                        chunk_hash: hash.to_vec(),
-                        data,
-                        seq: seq as u32,
-                    })
-                    .await;
+            match tokio::fs::read(&path).await {
+                Ok(data) => {
+                    let _ = tx
+                        .send(UploadChunk {
+                            game_id,
+                            chunk_hash: hash.to_vec(),
+                            data,
+                            seq: seq as u32,
+                        })
+                        .await;
+                }
+                Err(err) => {
+                    eprintln!("读取暂存块失败: {}: {err}", path.display());
+                    failures
+                        .lock()
+                        .expect("读取失败列表锁不应被污染")
+                        .push(*hash);
+                }
             }
         }
     });
@@ -134,6 +145,17 @@ pub async fn upload_delta(
                 .expect("服务端返回 32 字节哈希");
             summary.failed.push(hash);
         }
+    }
+    let failed_reads = read_failures
+        .lock()
+        .expect("读取失败列表锁不应被污染")
+        .clone();
+    if !failed_reads.is_empty() {
+        bail!(
+            "读取暂存块失败 {} 块，示例: {}",
+            failed_reads.len(),
+            hex(&failed_reads[0])
+        );
     }
     Ok(summary)
 }
@@ -337,11 +359,10 @@ mod tests {
         // 预检通过但读取失败：同名目录会让 exists() 为真而 fs::read 报错。
         let bad = [10u8; 32];
         fs::create_dir(stage.join(format!("{}.blk", hex(&bad)))).unwrap();
-        let summary = upload_delta(&mut client, 1, &stage, &[bad], &None)
+        let err = upload_delta(&mut client, 1, &stage, &[bad], &None)
             .await
-            .unwrap();
-        assert_eq!(summary.uploaded, 0);
-        assert_eq!(summary.skipped, 0);
+            .unwrap_err();
+        assert!(err.to_string().contains("读取暂存块失败"));
         let _ = shutdown.send(());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -152,6 +152,11 @@ impl Config {
         if (self.origin_endpoint.is_some()) != (self.origin_addr.is_some()) {
             bail!("origin_endpoint 与 origin_addr 必须同时配置或同时缺省");
         }
+        if self.node_type == NodeType::Cafe
+            && (self.origin_endpoint.is_some() || self.origin_addr.is_some())
+        {
+            bail!("网吧节点不得配置 origin_endpoint/origin_addr（网吧只从 IDC 拉取）");
+        }
         if let Some(addr) = &self.origin_addr {
             addr.parse::<SocketAddr>()
                 .map_err(|_| anyhow::anyhow!("origin_addr 必须是 ip:port"))?;
@@ -263,6 +268,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("origin_endpoint"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_cafe_forbids_origin() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-cafeorigin");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"cafe\"\ndata_dir = \"{}\"\norigin_endpoint = \"abc\"\norigin_addr = \"127.0.0.1:42001\"\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("网吧节点不得配置 origin"));
         let _ = fs::remove_dir_all(&dir);
     }
 

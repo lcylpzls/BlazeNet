@@ -249,40 +249,67 @@ impl TaskExecutor {
                 fallback.push(*hash);
             }
         }
-        if !fallback.is_empty() {
-            match (&self.config.origin_endpoint, &self.config.origin_addr) {
-                (Some(endpoint), Some(addr)) => groups.push((
-                    PeerTarget {
-                        endpoint_id: endpoint.parse().context("原始节点端点 ID 非法")?,
-                        addr: Some(addr.parse().context("原始节点地址非法")?),
-                        relay_url: self.config.relay_url.clone(),
-                        direct_only: false,
-                    },
-                    fallback,
-                )),
-                _ => bail!(
-                    "块无候选源且未配置原始节点: 游戏 {game_id} 缺 {} 块",
-                    fallback.len()
-                ),
-            }
-        }
-        let ep = fetch::build_endpoint(self.config.relay_url.as_deref()).await?;
+        let origin_target = match (&self.config.origin_endpoint, &self.config.origin_addr) {
+            (Some(endpoint), Some(addr)) => Some(PeerTarget {
+                endpoint_id: endpoint.parse().context("原始节点端点 ID 非法")?,
+                addr: Some(addr.parse().context("原始节点地址非法")?),
+                relay_url: self.config.relay_url.clone(),
+                direct_only: false,
+            }),
+            _ => None,
+        };
+        // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
+        let direct_ep = fetch::build_endpoint(None).await?;
         let mut downloaded = Vec::new();
-        let mut failed: Vec<[u8; 32]> = Vec::new();
+        let mut retry: Vec<[u8; 32]> = fallback;
         for (target, hashes) in groups {
             let _permit = self.source_permits.acquire().await;
-            let stats = fetch::fetch_chunks(&ep, &target, game_id, &hashes, |hash, data| {
+            let ep = Self::choose_ep(&target, &direct_ep)?;
+            match fetch::fetch_chunks(ep, &target, game_id, &hashes, |hash, data| {
+                sink(hash, data)?;
+                downloaded.push(hash);
+                Ok(())
+            })
+            .await
+            {
+                Ok(stats) => retry.extend(stats.failed),
+                Err(err) => {
+                    println!("候选源连接失败，转入原始节点重试: {err:#}");
+                    retry.extend(hashes);
+                }
+            }
+        }
+        if !retry.is_empty() {
+            let Some(target) = origin_target else {
+                bail!(
+                    "块无候选源且未配置原始节点: 游戏 {game_id} 缺 {} 块",
+                    retry.len()
+                );
+            };
+            retry.sort_unstable();
+            retry.dedup();
+            let stats = fetch::fetch_chunks(&direct_ep, &target, game_id, &retry, |hash, data| {
                 sink(hash, data)?;
                 downloaded.push(hash);
                 Ok(())
             })
             .await?;
-            failed.extend(stats.failed);
-        }
-        if !failed.is_empty() {
-            bail!("仍有 {} 块下载失败", failed.len());
+            if !stats.failed.is_empty() {
+                bail!("仍有 {} 块下载失败", stats.failed.len());
+            }
         }
         Ok(downloaded)
+    }
+
+    fn choose_ep<'a>(
+        target: &PeerTarget,
+        direct: &'a iroh::Endpoint,
+    ) -> Result<&'a iroh::Endpoint> {
+        if target.addr.is_some() {
+            Ok(direct)
+        } else {
+            bail!("源无直连地址，无法传输数据（relay 只打洞不传数据）")
+        }
     }
 
     async fn report_chunks(
@@ -828,6 +855,37 @@ mod tests {
         let bytes = manifest(&[("a.bin", b"hello")]);
         let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
         store.save_version(1, 1, &bytes).unwrap();
+        let (exec, _data, _pack, _cafe) = executor(
+            config(
+                NodeType::Idc,
+                idc_dir,
+                url,
+                Some(handle.endpoint_id().to_string()),
+                Some(format!("127.0.0.1:{}", handle.port())),
+            ),
+            1,
+        );
+        let err = exec.run_task(task(1, 1, 1)).await.unwrap_err();
+        assert!(err.to_string().contains("下载失败"));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_idc_peer_unreachable_falls_back_to_origin() {
+        let dir = std::env::temp_dir().join("blaze-exec-fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let idc_dir = dir.join("idc");
+        let seed_dir = dir.join("seed");
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let (handle, hashes) = seed_server(&seed_dir, 1).await;
+        let bytes = manifest(&[("a.bin", b"hello")]);
+        let (url, _service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        // 候选 peer 地址不可达：连接失败后应回退原始节点。
         store
             .insert_node(&NodeRecord {
                 id: 2,
@@ -835,7 +893,7 @@ mod tests {
                 endpoint_id: handle.endpoint_id().to_string(),
                 token: "bad".to_string(),
                 addrs: vec![AddrRecord {
-                    addr: format!("127.0.0.1:{}", handle.port()),
+                    addr: "127.0.0.1:1".to_string(),
                     kind: "config".to_string(),
                     link: String::new(),
                 }],
@@ -843,11 +901,23 @@ mod tests {
                 last_heartbeat_ms: 1,
             })
             .unwrap();
-        store.record_chunk_holder(2, 1, &wrong_hash).unwrap();
-        let (exec, _data, _pack, _cafe) =
-            executor(config(NodeType::Idc, idc_dir, url, None, None), 1);
-        let err = exec.run_task(task(1, 1, 1)).await.unwrap_err();
-        assert!(err.to_string().contains("下载失败"));
+        store.record_chunk_holder(2, 1, &hashes[0]).unwrap();
+        let (exec, _data, pack_stores, _cafe) = executor(
+            config(
+                NodeType::Idc,
+                idc_dir,
+                url,
+                Some(handle.endpoint_id().to_string()),
+                Some(format!("127.0.0.1:{}", handle.port())),
+            ),
+            1,
+        );
+        exec.run_task(task(1, 1, 1)).await.unwrap();
+        let local = pack_stores.lock().await.get(&1).unwrap().clone();
+        {
+            let guard = local.lock().unwrap();
+            assert!(guard.contains(&hashes[0]).unwrap());
+        }
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -976,5 +1046,28 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_choose_ep_direct_relay_and_missing() {
+        let direct = fetch::build_endpoint(None).await.unwrap();
+        let with_addr = PeerTarget {
+            endpoint_id: direct.id(),
+            addr: Some("127.0.0.1:1".parse().unwrap()),
+            relay_url: None,
+            direct_only: true,
+        };
+        assert!(std::ptr::eq(
+            TaskExecutor::choose_ep(&with_addr, &direct).unwrap(),
+            &direct
+        ));
+        let no_addr = PeerTarget {
+            endpoint_id: direct.id(),
+            addr: None,
+            relay_url: Some("https://127.0.0.1:8443".to_string()),
+            direct_only: false,
+        };
+        let err = TaskExecutor::choose_ep(&no_addr, &direct).unwrap_err();
+        assert!(err.to_string().contains("无直连地址"));
     }
 }

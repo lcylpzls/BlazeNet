@@ -271,6 +271,9 @@ impl Control for ControlService {
             let Some(node) = self.store.get_node(id).map_err(query_node_error)? else {
                 continue;
             };
+            if node.status != "online" {
+                continue;
+            }
             peers.push(Peer {
                 node_id: node.id,
                 endpoint_id: node.endpoint_id,
@@ -371,7 +374,7 @@ mod tests {
     use super::*;
     use blaze_proto::control::control_client::ControlClient;
     use blaze_proto::control::{
-        Addr, ChunkDone, HeartbeatRequest, RegisterRequest, TaskFilter, TaskReport,
+        Addr, ChunkDone, HeartbeatRequest, PeerQuery, RegisterRequest, TaskFilter, TaskReport,
     };
     use std::fs;
     use std::time::Duration;
@@ -805,5 +808,51 @@ mod tests {
                 .message()
                 .contains("块账本操作失败")
         );
+    }
+
+    #[tokio::test]
+    async fn test_query_peers_skips_offline_nodes() {
+        let dir = std::env::temp_dir().join("blaze-sched-offline");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let service = ControlService::new(store.clone());
+        let hash = [7u8; 32];
+        for (id, status) in [(1u64, "online"), (2, "offline")] {
+            store
+                .insert_node(&NodeRecord {
+                    id,
+                    node_type: "idc".to_string(),
+                    endpoint_id: format!("ep-{id}"),
+                    token: "tok".to_string(),
+                    addrs: vec![AddrRecord {
+                        addr: format!("127.0.0.1:{}", 42000 + id),
+                        kind: "config".to_string(),
+                        link: String::new(),
+                    }],
+                    status: status.to_string(),
+                    last_heartbeat_ms: 1,
+                })
+                .unwrap();
+            store.record_chunk_holder(id, 9, &hash).unwrap();
+        }
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let svc = service.clone();
+        let _handle = serve(addr, svc).await.unwrap();
+        let mut client = connect_retry(&format!("http://{addr}")).await.unwrap();
+        let peers = client
+            .query_peers(PeerQuery {
+                game_id: 9,
+                chunk_hash: hash.to_vec(),
+                limit: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(peers.peers.len(), 1);
+        assert_eq!(peers.peers[0].node_id, 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
