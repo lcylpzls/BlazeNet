@@ -47,6 +47,10 @@ fn main() -> Result<()> {
     println!("逐块哈希校验: 通过 {ok}，失败 {bad}");
 
     let published = data_dir.join(game_id.to_string()).join("published");
+    if !published.is_dir() {
+        println!("published 目录不存在（节点未发布版本清单），跳过清单检查");
+        return Ok(());
+    }
     let mut versions: Vec<(u64, HashSet<[u8; 32]>, usize)> = Vec::new();
     for entry in std::fs::read_dir(&published).context("读取 published 目录失败")? {
         let entry = entry.context("读取 published 目录项失败")?;
