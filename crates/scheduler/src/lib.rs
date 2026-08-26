@@ -32,12 +32,10 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
     );
     println!("当前节点数: {}", store.list_nodes()?.len());
 
-    let grpc_handle = server::serve(
-        config.bind_socket_addr()?,
-        server::ControlService::new(store.clone()),
-    )
-    .await
-    .context("启动控制面 gRPC 服务失败")?;
+    let control = server::ControlService::new(store.clone());
+    let grpc_handle = server::serve(config.bind_socket_addr()?, control.clone())
+        .await
+        .context("启动控制面 gRPC 服务失败")?;
 
     let keepalive_socket = Arc::new(
         tokio::net::UdpSocket::bind("0.0.0.0:0")
@@ -61,6 +59,7 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
         config.admin_user.clone(),
         config.admin_password.clone(),
         store.clone(),
+        control,
     );
     let (http_tx, http_rx) = tokio::sync::oneshot::channel();
     let http_task = tokio::spawn(async move {

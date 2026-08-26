@@ -15,12 +15,14 @@ use crate::db::{
     AddrRecord, GameRecord, GroupRecord, NodeRecord, PlaceRecord, Store, TaskRecord, UserRecord,
     hash_password,
 };
+use crate::server::ControlService;
 
 #[derive(Clone)]
 pub struct HttpState {
     admin_user: String,
     admin_password: String,
     store: Arc<Store>,
+    control: ControlService,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +56,14 @@ pub struct CreateGroupRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateGameRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskRequest {
+    node_id: u64,
+    game_id: u64,
+    version: u64,
+    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +290,40 @@ async fn create_game(
     Ok(Json(game))
 }
 
+/// 创建并推送任务给指定节点（端到端联调用）。
+async fn create_task(
+    State(state): State<HttpState>,
+    Json(request): Json<CreateTaskRequest>,
+) -> Result<Json<TaskRecord>, StatusCode> {
+    if request.kind.is_empty() {
+        return Err(bad_request());
+    }
+    if state
+        .store
+        .get_node(request.node_id)
+        .map_err(store_error)?
+        .is_none()
+    {
+        return Err(not_found());
+    }
+    let task = TaskRecord {
+        id: state.store.next_task_id().map_err(store_error)?,
+        node_id: request.node_id,
+        game_id: request.game_id,
+        version: request.version,
+        kind: request.kind,
+        assigned_chunks: Vec::new(),
+        status: "queued".to_string(),
+        error: String::new(),
+    };
+    state
+        .control
+        .push_task(task.clone())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(task))
+}
+
 async fn delete_game(
     State(state): State<HttpState>,
     Path(id): Path<u64>,
@@ -296,6 +340,7 @@ pub fn router(
     admin_user: String,
     admin_password: String,
     store: Arc<Store>,
+    control: ControlService,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -308,7 +353,7 @@ pub fn router(
         .route("/api/groups", get(list_groups).post(create_group))
         .route("/api/groups/{id}", delete(delete_group))
         .route("/api/nodes", get(list_nodes))
-        .route("/api/tasks", get(list_tasks))
+        .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/games", get(list_games).post(create_game))
         .route("/api/games/{id}", delete(delete_game))
         .route("/api/bindings", post(bind))
@@ -317,6 +362,7 @@ pub fn router(
             admin_user,
             admin_password,
             store,
+            control,
         })
 }
 
@@ -334,7 +380,8 @@ mod tests {
             dir.to_path_buf(),
             "admin".to_string(),
             "secret".to_string(),
-            store,
+            store.clone(),
+            ControlService::new(store),
         )
     }
 
@@ -685,7 +732,8 @@ mod tests {
             dir.clone(),
             "admin".to_string(),
             "secret".to_string(),
-            store,
+            store.clone(),
+            ControlService::new(store),
         );
         for uri in ["/api/nodes", "/api/tasks", "/api/games"] {
             let response = app
@@ -721,6 +769,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        // 创建并推送任务：节点存在时成功，节点不存在时 404，空类型 400。
+        let created_task = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"node_id":1,"game_id":3,"version":2,"kind":"UPDATE"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created_task.status(), StatusCode::OK);
+        let missing_node = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"node_id":99,"game_id":3,"version":2,"kind":"UPDATE"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_node.status(), StatusCode::NOT_FOUND);
+        let empty_kind = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"node_id":1,"game_id":3,"version":2,"kind":""}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_kind.status(), StatusCode::BAD_REQUEST);
         let deleted = app
             .clone()
             .oneshot(
