@@ -163,6 +163,29 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+/// Prometheus 文本格式基础指标（二期可观测，三期接入大盘）。
+async fn metrics(State(state): State<HttpState>) -> String {
+    let nodes = state.store.list_nodes().unwrap_or_default();
+    let online = nodes.iter().filter(|n| n.status == "online").count();
+    let tasks = state.store.list_tasks().unwrap_or_default();
+    let done = tasks.iter().filter(|t| t.status == "done").count();
+    let failed = tasks.iter().filter(|t| t.status == "failed").count();
+    let running = tasks.iter().filter(|t| t.status == "running").count();
+    let games = state.store.list_games().unwrap_or_default().len();
+    let audits = state.store.list_audits().unwrap_or_default().len();
+    format!(
+        "# HELP blazenet_nodes_total 节点总数\n# TYPE blazenet_nodes_total gauge\nblazenet_nodes_total {}\n# HELP blazenet_nodes_online 在线节点数\n# TYPE blazenet_nodes_online gauge\nblazenet_nodes_online {}\n# HELP blazenet_tasks_total 任务总数\n# TYPE blazenet_tasks_total gauge\nblazenet_tasks_total {}\n# HELP blazenet_tasks_running 运行中任务\n# TYPE blazenet_tasks_running gauge\nblazenet_tasks_running {}\n# HELP blazenet_tasks_done 完成任务\n# TYPE blazenet_tasks_done gauge\nblazenet_tasks_done {}\n# HELP blazenet_tasks_failed 失败任务\n# TYPE blazenet_tasks_failed gauge\nblazenet_tasks_failed {}\n# HELP blazenet_games_total 游戏总数\n# TYPE blazenet_games_total gauge\nblazenet_games_total {}\n# HELP blazenet_audits_total 审计日志数\n# TYPE blazenet_audits_total gauge\nblazenet_audits_total {}\n",
+        nodes.len(),
+        online,
+        tasks.len(),
+        running,
+        done,
+        failed,
+        games,
+        audits
+    )
+}
+
 async fn login(
     State(state): State<HttpState>,
     Json(request): Json<LoginRequest>,
@@ -454,6 +477,36 @@ async fn rollback_game(
     Ok(Json(task))
 }
 
+/// 取消排队中的任务；运行中/已完成任务不允许取消。
+async fn cancel_task(
+    State(state): State<HttpState>,
+    Path(id): Path<u64>,
+) -> Result<StatusCode, StatusCode> {
+    let Some(task) = state
+        .store
+        .list_tasks()
+        .map_err(store_error)?
+        .into_iter()
+        .find(|t| t.id == id)
+    else {
+        return Err(not_found());
+    };
+    if task.status != "queued" {
+        return Err(bad_request());
+    }
+    state
+        .store
+        .update_task_status(id, "cancelled", "人工取消")
+        .map_err(store_error)?;
+    audit(
+        &state,
+        "取消任务",
+        &format!("任务 ID {id} 已取消（排队中）"),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn delete_game(
     State(state): State<HttpState>,
     Path(id): Path<u64>,
@@ -475,6 +528,7 @@ pub fn router(
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/api/login", post(login))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{id}", delete(delete_user))
@@ -485,6 +539,7 @@ pub fn router(
         .route("/api/groups/{id}", delete(delete_group))
         .route("/api/nodes", get(list_nodes))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/tasks/{id}/cancel", post(cancel_task))
         .route("/api/games", get(list_games).post(create_game))
         .route("/api/audit", get(list_audits))
         .route("/api/games/{id}", delete(delete_game))
@@ -538,6 +593,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let dir = std::env::temp_dir().join("blaze-http-metrics");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (app, store) = app_with_store(&dir);
+        store
+            .insert_node(&NodeRecord {
+                id: 1,
+                node_type: "idc".to_string(),
+                endpoint_id: "ep".to_string(),
+                token: "tok".to_string(),
+                addrs: vec![],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store
+            .insert_task(&TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "done".to_string(),
+                error: String::new(),
+            })
+            .unwrap();
+        store
+            .insert_game(&GameRecord {
+                id: 1,
+                name: "G".to_string(),
+                status: "ready".to_string(),
+                current_version: 1,
+                latest_version: 1,
+            })
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        for key in [
+            "blazenet_nodes_total 1",
+            "blazenet_nodes_online 1",
+            "blazenet_tasks_total 1",
+            "blazenet_tasks_done 1",
+            "blazenet_games_total 1",
+        ] {
+            assert!(text.contains(key), "缺少指标: {key}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_queued_task() {
+        let dir = std::env::temp_dir().join("blaze-http-cancel");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (app, store) = app_with_store(&dir);
+        store
+            .insert_task(&TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .unwrap();
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/1/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+        let tasks = store.list_tasks().unwrap();
+        assert_eq!(tasks[0].status, "cancelled");
+        let again = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/1/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tasks/99/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(&dir);
     }
 

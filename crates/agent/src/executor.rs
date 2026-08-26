@@ -1,6 +1,7 @@
 //! 任务执行器：拉版本清单 → 对账 → 多源下载 → 入库/合并 → 上报。
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use blaze_common::manifest::GameIndex;
@@ -229,7 +230,9 @@ impl TaskExecutor {
                 .into_inner()
                 .peers;
             if let Some(peer) = peers.into_iter().find(|p| !p.addrs.is_empty()) {
-                let addr = peer.addrs[0].addr.parse().ok();
+                // 多 IP 分流：按块哈希轮询地址，同一节点的多个公网地址可并行。
+                let idx = hash[0] as usize % peer.addrs.len();
+                let addr = peer.addrs[idx].addr.parse().ok();
                 let target = PeerTarget {
                     endpoint_id: peer.endpoint_id.parse().context("候选端点 ID 非法")?,
                     addr,
@@ -267,6 +270,9 @@ impl TaskExecutor {
         };
         // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
         let direct_ep = fetch::build_endpoint(None).await?;
+        let rate = self.config.download_mbps;
+        let started = Instant::now();
+        let mut total_bytes = 0u64;
         let mut downloaded = Vec::new();
         let mut retry = Vec::new();
         let mut blocked = Vec::new();
@@ -288,6 +294,7 @@ impl TaskExecutor {
             .await
             {
                 Ok(stats) => {
+                    Self::throttle(rate, &mut total_bytes, stats.bytes, started).await;
                     for hash in stats.failed {
                         if assigned.contains(&hash) {
                             retry.push(hash);
@@ -335,6 +342,7 @@ impl TaskExecutor {
                 Ok(())
             })
             .await?;
+            Self::throttle(rate, &mut total_bytes, stats.bytes, started).await;
             if !stats.failed.is_empty() {
                 bail!("仍有 {} 块下载失败", stats.failed.len());
             }
@@ -350,6 +358,18 @@ impl TaskExecutor {
             Ok(direct)
         } else {
             bail!("源无直连地址，无法传输数据（relay 只打洞不传数据）")
+        }
+    }
+
+    /// 下载限速：按累计字节数维持平均 Mbps 上限。
+    async fn throttle(rate: Option<u64>, total_bytes: &mut u64, bytes: u64, started: Instant) {
+        if let Some(mbps) = rate {
+            *total_bytes += bytes;
+            let target_secs = *total_bytes as f64 / (mbps as f64 * 1024.0 * 1024.0 / 8.0);
+            let elapsed = started.elapsed().as_secs_f64();
+            if target_secs > elapsed {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(target_secs - elapsed)).await;
+            }
         }
     }
 
@@ -514,6 +534,7 @@ mod tests {
             compact_threshold: 0.3,
             listen_port: 0,
             temp_ttl_hours: 24,
+            download_mbps: None,
             origin_endpoint,
             origin_addr,
             keepalive_port: None,
@@ -617,16 +638,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let (exec, _data, pack_stores, _cafe) = executor(
-            config(
-                NodeType::Idc,
-                idc_dir.clone(),
-                url,
-                Some(handle.endpoint_id().to_string()),
-                Some(format!("127.0.0.1:{}", handle.port())),
-            ),
-            1,
+        let mut cfg = config(
+            NodeType::Idc,
+            idc_dir.clone(),
+            url,
+            Some(handle.endpoint_id().to_string()),
+            Some(format!("127.0.0.1:{}", handle.port())),
         );
+        cfg.download_mbps = Some(1);
+        let (exec, _data, pack_stores, _cafe) = executor(cfg, 1);
         exec.run_task(assigned_task(1, 1, 1, &hashes))
             .await
             .unwrap();
@@ -1002,16 +1022,15 @@ mod tests {
             })
             .unwrap();
         store.record_chunk_holder(2, 1, &hashes[0]).unwrap();
-        let (exec, _data, pack_stores, _cafe) = executor(
-            config(
-                NodeType::Idc,
-                idc_dir,
-                url,
-                Some(handle.endpoint_id().to_string()),
-                Some(format!("127.0.0.1:{}", handle.port())),
-            ),
-            1,
+        let mut cfg = config(
+            NodeType::Idc,
+            idc_dir,
+            url,
+            Some(handle.endpoint_id().to_string()),
+            Some(format!("127.0.0.1:{}", handle.port())),
         );
+        cfg.download_mbps = Some(1);
+        let (exec, _data, pack_stores, _cafe) = executor(cfg, 1);
         exec.run_task(assigned_task(1, 1, 1, &hashes))
             .await
             .unwrap();
@@ -1335,5 +1354,15 @@ mod tests {
         };
         let err = TaskExecutor::choose_ep(&no_addr, &direct).unwrap_err();
         assert!(err.to_string().contains("无直连地址"));
+    }
+
+    #[tokio::test]
+    async fn test_throttle_none_and_limited() {
+        let started = Instant::now();
+        let mut total = 0u64;
+        TaskExecutor::throttle(None, &mut total, 100, started).await;
+        assert_eq!(total, 0);
+        TaskExecutor::throttle(Some(1), &mut total, 5, started).await;
+        assert_eq!(total, 5);
     }
 }

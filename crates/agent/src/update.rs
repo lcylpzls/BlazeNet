@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use blaze_common::manifest::{FileEntry, GameIndex};
@@ -19,6 +19,9 @@ pub struct MergeSummary {
 pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// 全库 哈希 →（相对路径, 偏移, 长度）映射（支持文件重命名/内容复用）。
+type ChunkLocation = HashMap<[u8; 32], (PathBuf, u64, u32)>;
 
 fn parse_hex(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
@@ -75,6 +78,7 @@ fn write_new_file(
     entry: &FileEntry,
     old_chunks: Option<&HashMap<[u8; 32], (u64, u32)>>,
     old_file: Option<&Path>,
+    global_chunks: Option<&ChunkLocation>,
     temp_dir: &Path,
 ) -> Result<()> {
     let target = game_dir.join(&entry.name);
@@ -85,11 +89,15 @@ fn write_new_file(
     let mut out = fs::File::create(&new_path).context("创建临时文件失败")?;
     let mut hasher = blake3::Hasher::new();
     for chunk in &entry.chunks {
-        let data = if let (Some(old_file), Some(map)) = (old_file, old_chunks) {
-            if old_file.is_file()
-                && let Some((offset, len)) = map.get(&chunk.hash)
-            {
-                read_chunk_at(old_file, *offset, *len)?
+        let data = if let (Some(old_file), Some(map)) = (old_file, old_chunks)
+            && old_file.is_file()
+            && let Some((offset, len)) = map.get(&chunk.hash)
+        {
+            read_chunk_at(old_file, *offset, *len)?
+        } else if let Some((rel, offset, len)) = global_chunks.and_then(|m| m.get(&chunk.hash)) {
+            let path = game_dir.join(rel);
+            if path.is_file() {
+                read_chunk_at(&path, *offset, *len)?
             } else {
                 fs::read(temp_dir.join(format!("{}.blk", hex(&chunk.hash))))
                     .context("读取临时块失败")?
@@ -141,6 +149,21 @@ pub fn merge_files(
                 .collect()
         })
         .unwrap_or_default();
+    // 全库哈希→位置映射：支持文件重命名/内容复用（旧文件新文件名直接复用）。
+    let mut global_chunks: ChunkLocation = HashMap::new();
+    if let Some(old) = old {
+        for file in &old.files {
+            let mut offset = 0u64;
+            for chunk in &file.chunks {
+                global_chunks.entry(chunk.hash).or_insert((
+                    PathBuf::from(&file.name),
+                    offset,
+                    chunk.len,
+                ));
+                offset += u64::from(chunk.len);
+            }
+        }
+    }
     let old_names: HashSet<&str> = old_files.keys().copied().collect();
     let new_names: HashSet<&str> = new.files.iter().map(|f| f.name.as_str()).collect();
 
@@ -158,7 +181,14 @@ pub fn merge_files(
         let old_file = old_files
             .get(entry.name.as_str())
             .map(|_| game_dir.join(&entry.name));
-        match write_new_file(game_dir, entry, old_chunks, old_file.as_deref(), temp_dir) {
+        match write_new_file(
+            game_dir,
+            entry,
+            old_chunks,
+            old_file.as_deref(),
+            Some(&global_chunks),
+            temp_dir,
+        ) {
             Ok(()) => summary.merged += 1,
             Err(err) => {
                 let _ = fs::remove_file(game_dir.join(&entry.name).with_extension("new"));
@@ -273,7 +303,7 @@ mod tests {
         let summary = merge_files(&game_dir, &new, Some(&old), &temp_dir).unwrap();
         assert_eq!(summary.merged, 2);
         assert_eq!(summary.deleted, 1);
-        assert!(summary.failed.is_empty());
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
         assert_eq!(fs::read(game_dir.join("a.bin")).unwrap(), new_a);
         assert_eq!(fs::read(game_dir.join("c.bin")).unwrap(), b"new");
         assert_eq!(fs::read(game_dir.join("d.bin")).unwrap(), b"same");
@@ -345,9 +375,39 @@ mod tests {
         fs::remove_file(game_dir.join("a.bin")).unwrap();
         fs::write(temp_dir.join(format!("{}.blk", hex(&hash))), &data).unwrap();
         let summary = merge_files(&game_dir, &manifest, Some(&manifest), &temp_dir).unwrap();
-        assert!(summary.failed.is_empty());
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
         assert_eq!(summary.merged, 1);
         assert_eq!(fs::read(game_dir.join("a.bin")).unwrap(), data);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_reuses_renamed_file() {
+        let dir = std::env::temp_dir().join("blaze-upd-rename");
+        let _ = fs::remove_dir_all(&dir);
+        let game_dir = dir.join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+        let temp_dir = dir.join("temp");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let data = b"hello".to_vec();
+        let hash = hash_of(&data);
+        let file = |name: &str| FileEntry {
+            name: name.to_string(),
+            file_hash: hash,
+            chunks: vec![ChunkMeta {
+                hash,
+                len: data.len() as u32,
+            }],
+        };
+        let old = index(vec![file("a.bin")]);
+        let new = index(vec![file("b.bin")]);
+        fs::write(game_dir.join("a.bin"), &data).unwrap();
+        let summary = merge_files(&game_dir, &new, Some(&old), &temp_dir).unwrap();
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        assert_eq!(summary.merged, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(fs::read(game_dir.join("b.bin")).unwrap(), data);
+        assert!(!game_dir.join("a.bin").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

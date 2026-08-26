@@ -21,6 +21,7 @@ pub struct PeerTarget {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct FetchStats {
     pub downloaded: usize,
+    pub bytes: u64,
     pub failed: Vec<[u8; HASH_LEN]>,
 }
 
@@ -114,6 +115,7 @@ where
             continue;
         }
         stats.downloaded += 1;
+        stats.bytes += len as u64;
     }
     Ok(stats)
 }

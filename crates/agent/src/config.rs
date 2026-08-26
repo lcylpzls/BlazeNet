@@ -77,6 +77,8 @@ pub struct Config {
     /// 网吧临时块保留小时数（到期清理后改读真实文件偏移）。
     #[serde(default = "default_temp_ttl_hours")]
     pub temp_ttl_hours: u64,
+    /// 下载限速（Mbps）；缺省不限速。
+    pub download_mbps: Option<u64>,
     /// IDC 回退源：原始节点数据面端点 ID。
     pub origin_endpoint: Option<String>,
     /// IDC 回退源：原始节点数据面地址（ip:port）。
@@ -148,6 +150,11 @@ impl Config {
         }
         if self.temp_ttl_hours == 0 {
             bail!("temp_ttl_hours 必须大于 0");
+        }
+        if let Some(mbps) = self.download_mbps
+            && mbps == 0
+        {
+            bail!("download_mbps 必须大于 0");
         }
         if (self.origin_endpoint.is_some()) != (self.origin_addr.is_some()) {
             bail!("origin_endpoint 与 origin_addr 必须同时配置或同时缺省");
@@ -234,6 +241,7 @@ mod tests {
         assert_eq!(config.compact_threshold, DEFAULT_COMPACT_THRESHOLD);
         assert_eq!(config.listen_port, DEFAULT_LISTEN_PORT);
         assert_eq!(config.temp_ttl_hours, DEFAULT_TEMP_TTL_HOURS);
+        assert_eq!(config.download_mbps, None);
         assert_eq!(config.origin_endpoint, None);
         assert_eq!(config.origin_addr, None);
         let _ = fs::remove_dir_all(&dir);
@@ -284,6 +292,22 @@ mod tests {
         );
         let err = Config::load(&path).unwrap_err();
         assert!(err.to_string().contains("网吧节点不得配置 origin"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_invalid_download_mbps() {
+        let dir = std::env::temp_dir().join("blaze-agent-cfg-rate");
+        fs::create_dir_all(&dir).unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "node_type = \"idc\"\ndata_dir = \"{}\"\ndownload_mbps = 0\n",
+                dir.display()
+            ),
+        );
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("download_mbps"));
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -58,6 +58,22 @@ describe('后台 API 客户端', () => {
     await expect(api('/api/x')).rejects.toThrow('请求失败: 500');
   });
 
+  it('网络错误自动重试一次', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError('network'))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ok: 1 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const data = await api<{ ok: number }>('/api/retry');
+    expect(data).toEqual({ ok: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('204 响应返回 undefined', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
     const result = await api('/api/x');
