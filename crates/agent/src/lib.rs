@@ -27,8 +27,9 @@ pub async fn start(config: config::Config) -> Result<datapath::DataPathHandle> {
     )
     .await?;
     println!(
-        "agent 数据面启动：类型 {}，数据目录 {}，监听端口 {}，relay {}",
+        "agent 数据面启动：类型 {}，端点 {}，数据目录 {}，监听端口 {}，relay {}",
         config.node_type,
+        handle.endpoint_id(),
         config.data_dir.display(),
         config.listen_port,
         config.relay_url.as_deref().unwrap_or("无")

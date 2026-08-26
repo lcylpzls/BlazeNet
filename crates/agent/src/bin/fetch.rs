@@ -2,6 +2,7 @@
 use anyhow::{Context, Result};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr};
+use iroh_relay::tls::CaTlsConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const ALPN: &[u8] = b"blazenet/1";
@@ -9,24 +10,44 @@ const ALPN: &[u8] = b"blazenet/1";
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
-        anyhow::bail!("用法: fetch <端点ID> <ip:port> <game_id> <块哈希hex>");
+    if args.len() != 5 && args.len() != 6 {
+        anyhow::bail!("用法: fetch <端点ID> <ip:port> <game_id> <块哈希hex> [relay_url]");
     }
     let endpoint_id: iroh::EndpointId = args[1].parse()?;
-    let addr: std::net::SocketAddr = args[2].parse()?;
     let game_id: u64 = args[3].parse()?;
     let hash: [u8; 32] = hex_decode(&args[4])?;
+    let relay_url = if args[2].starts_with("https://") {
+        Some(args[2].clone())
+    } else {
+        args.get(5).cloned()
+    };
 
-    let ep = Endpoint::builder(presets::Minimal)
+    let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
-        .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
-        .bind_addr("0.0.0.0:0")?
-        .bind()
-        .await?;
-    let target = EndpointAddr::from_parts(endpoint_id, [TransportAddr::Ip(addr)]);
+        .bind_addr("0.0.0.0:0")?;
+    let target = if let Some(url) = relay_url {
+        let relay: iroh::RelayUrl = url.parse()?;
+        builder = builder
+            .relay_mode(RelayMode::Custom(iroh::RelayMap::from_iter(
+                [relay.clone()],
+            )))
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify());
+        EndpointAddr::new(endpoint_id).with_relay_url(relay)
+    } else {
+        builder = builder.relay_mode(RelayMode::Disabled);
+        let addr: std::net::SocketAddr = args[2].parse()?;
+        EndpointAddr::from_parts(endpoint_id, [TransportAddr::Ip(addr)])
+    };
+    let ep = builder.bind().await?;
     let conn = ep.connect(target, ALPN).await.context("连接失败")?;
+    let paths = conn.paths();
+    println!(
+        "连接路径：direct={} relay={}",
+        paths.iter().any(|p| p.is_ip()),
+        paths.iter().any(|p| p.is_relay())
+    );
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi 失败")?;
     send.write_u64(game_id).await?;
     send.write_u32(1).await?;

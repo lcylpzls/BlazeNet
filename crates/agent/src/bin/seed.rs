@@ -10,5 +10,16 @@ fn main() -> Result<()> {
     let data_dir = PathBuf::from(&args[1]);
     let game_id: u64 = args[2].parse()?;
     let chunk_count: usize = args[3].parse()?;
-    agent::seed(&data_dir, game_id, chunk_count)
+    let mut store = origin::storage::GameStore::open(&data_dir, game_id)?;
+    for i in 0..chunk_count {
+        let data = format!("blazenet-seed-{game_id}-{i:04}").repeat(64 * 1024);
+        let hash: [u8; 32] = blake3::hash(data.as_bytes()).into();
+        store.append_chunk(&hash, data.as_bytes())?;
+        println!(
+            "{i:04}: {}",
+            hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
+    println!("已写入 {chunk_count} 个种子块（游戏 {game_id}）");
+    Ok(())
 }
