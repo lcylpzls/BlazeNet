@@ -126,6 +126,8 @@ pub async fn serve(
     let (tx, rx) = oneshot::channel();
     let endpoint_id = endpoint.id();
     let task = tokio::spawn(accept_loop(endpoint.clone(), data_dir, rx));
+    // 等待 accept 循环就绪，避免测试/调用方立即连接失败
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     Ok(DataPathHandle {
         port,
         endpoint_id,

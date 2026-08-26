@@ -2,6 +2,7 @@
 pub mod config;
 pub mod datapath;
 pub mod download;
+pub mod update;
 
 use anyhow::Result;
 
