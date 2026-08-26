@@ -9,6 +9,10 @@ pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:50051";
 pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 25;
 /// 连续 3 次心跳判定离线（75 秒）。
 pub const DEFAULT_OFFLINE_TIMEOUT_SECS: u64 = 75;
+/// 保活探测周期默认 25 秒（窗口均摊）。
+pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 25;
+/// 连续失败默认 3 次标记不可达。
+pub const DEFAULT_KEEPALIVE_FAIL_THRESHOLD: u32 = 3;
 
 fn default_bind() -> String {
     DEFAULT_BIND_ADDR.to_string()
@@ -22,6 +26,14 @@ fn default_timeout() -> u64 {
     DEFAULT_OFFLINE_TIMEOUT_SECS
 }
 
+fn default_keepalive_interval() -> u64 {
+    DEFAULT_KEEPALIVE_INTERVAL_SECS
+}
+
+fn default_keepalive_threshold() -> u32 {
+    DEFAULT_KEEPALIVE_FAIL_THRESHOLD
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -31,6 +43,10 @@ pub struct Config {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_timeout")]
     pub offline_timeout_secs: u64,
+    #[serde(default = "default_keepalive_interval")]
+    pub keepalive_interval_secs: u64,
+    #[serde(default = "default_keepalive_threshold")]
+    pub keepalive_fail_threshold: u32,
 }
 
 impl Config {
@@ -72,6 +88,9 @@ impl Config {
         if self.offline_timeout_secs < self.heartbeat_interval_secs * 2 {
             bail!("离线超时至少应为心跳间隔的 2 倍");
         }
+        if self.keepalive_interval_secs == 0 || self.keepalive_fail_threshold == 0 {
+            bail!("保活周期与失败阈值必须大于 0");
+        }
         Ok(())
     }
 }
@@ -111,6 +130,14 @@ mod tests {
             DEFAULT_HEARTBEAT_INTERVAL_SECS
         );
         assert_eq!(config.offline_timeout_secs, DEFAULT_OFFLINE_TIMEOUT_SECS);
+        assert_eq!(
+            config.keepalive_interval_secs,
+            DEFAULT_KEEPALIVE_INTERVAL_SECS
+        );
+        assert_eq!(
+            config.keepalive_fail_threshold,
+            DEFAULT_KEEPALIVE_FAIL_THRESHOLD
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -178,5 +205,23 @@ mod tests {
         let err = Config::load(&cfg_path).unwrap_err();
         assert!(err.to_string().contains("data_dir"));
         let _ = fs::remove_file(&cfg_path);
+    }
+
+    #[test]
+    fn test_load_zero_keepalive() {
+        let dir = std::env::temp_dir().join("blaze-sched-cfg-keep");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scheduler.toml");
+        fs::write(
+            &path,
+            format!(
+                "data_dir = \"{}\"\nkeepalive_interval_secs = 0\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(err.to_string().contains("保活"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
