@@ -1,5 +1,6 @@
 //! 原始节点库：配置、块库；上传服务与版本发布（M2 后续实现）。
 pub mod config;
+pub mod server;
 pub mod storage;
 
 use anyhow::{Context, Result};

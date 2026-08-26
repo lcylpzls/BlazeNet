@@ -122,6 +122,17 @@ impl GameStore {
         Ok(Some(buf))
     }
 
+    /// 判断块是否存在（仅查索引，不读数据）。
+    pub fn contains(&self, hash: &[u8; HASH_LEN]) -> Result<bool> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let table = read_txn.open_table(TABLE).context("打开索引表失败")?;
+        let found = table
+            .get(&key(self.game_id, hash))
+            .context("查询索引失败")?
+            .is_some();
+        Ok(found)
+    }
+
     /// 延迟压缩：垃圾占比达阈值且可用空间足够时整文件重写。
     /// 返回是否执行了压缩；空间不足或未达阈值时返回 `false`。
     pub fn compact(
@@ -239,6 +250,18 @@ mod tests {
         assert_eq!(s.read_chunk(&h).unwrap(), Some(b"hello".to_vec()));
         assert_eq!(s.read_chunk(&hash(8)).unwrap(), None);
         assert_eq!(s.size(), 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_contains() {
+        let dir = std::env::temp_dir().join("blaze-store-contains");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h = hash(5);
+        assert!(!s.contains(&h).unwrap());
+        s.append_chunk(&h, b"data").unwrap();
+        assert!(s.contains(&h).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

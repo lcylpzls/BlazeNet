@@ -511,10 +511,15 @@ name = "origin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "blaze-common",
+ "blaze-proto",
  "redb",
  "serde",
+ "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
 ]
 
 [[package]]
