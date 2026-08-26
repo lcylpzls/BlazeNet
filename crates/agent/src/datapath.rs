@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use blaze_common::manifest::HASH_LEN;
+use iroh::endpoint::QuicTransportConfig;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, RelayMap, RelayMode, endpoint::Connection};
 use iroh_relay::tls::CaTlsConfig;
@@ -145,6 +146,12 @@ pub async fn serve(
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
         .clear_ip_transports()
+        .transport_config(
+            QuicTransportConfig::builder()
+                .send_observed_address_reports(true)
+                .receive_observed_address_reports(true)
+                .build(),
+        )
         .bind_addr(format!("0.0.0.0:{listen_port}"))?;
     if let Some(addr) = external_addr {
         builder = builder.external_addr(addr);

@@ -1,5 +1,6 @@
 //! 联调工具：从指定端点按哈希拉取块并校验。
 use anyhow::{Context, Result};
+use iroh::endpoint::QuicTransportConfig;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr};
 use iroh_relay::tls::CaTlsConfig;
@@ -31,7 +32,13 @@ async fn main() -> Result<()> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
-        .clear_ip_transports();
+        .clear_ip_transports()
+        .transport_config(
+            QuicTransportConfig::builder()
+                .send_observed_address_reports(true)
+                .receive_observed_address_reports(true)
+                .build(),
+        );
     builder = if let Some(addr) = external_addr {
         builder
             .external_addr(addr)
