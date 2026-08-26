@@ -811,4 +811,82 @@ mod tests {
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[tokio::test]
+    async fn test_cafe_rollback_restores_previous_version() {
+        let dir = std::env::temp_dir().join("blaze-exec-rollback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_dir = dir.join("seed");
+        let cafe_dir = dir.join("cafe");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&cafe_dir).unwrap();
+        let (handle, hashes) = seed_server(&seed_dir, 1).await;
+        let v1 = manifest(&[("a.bin", b"hello")]);
+        let v2 = manifest(&[("b.bin", b"world")]);
+        let (url, service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &v1).unwrap();
+        store.save_version(1, 2, &v2).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "peer".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        for hash in &hashes {
+            store.record_chunk_holder(2, 1, hash).unwrap();
+        }
+        for id in 1..=3u64 {
+            service
+                .push_task(TaskRecord {
+                    id,
+                    node_id: 1,
+                    game_id: 1,
+                    version: if id == 2 { 2 } else { 1 },
+                    kind: if id == 3 {
+                        "ROLLBACK".to_string()
+                    } else {
+                        "UPDATE".to_string()
+                    },
+                    assigned_chunks: vec![],
+                    status: "queued".to_string(),
+                    error: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let (exec, _data, _pack, cafe_stores) =
+            executor(config(NodeType::Cafe, cafe_dir.clone(), url, None, None), 1);
+        exec.run_task(task(1, 1, 1)).await.unwrap();
+        exec.run_task(task(2, 1, 2)).await.unwrap();
+        exec.run_task(Task {
+            id: 3,
+            game_id: 1,
+            version: 1,
+            kind: 2,
+            assigned_chunks: vec![],
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(cafe_dir.join("games/1/a.bin")).unwrap(),
+            b"hello"
+        );
+        assert!(!cafe_dir.join("games/1/b.bin").exists());
+        let cafe = cafe_stores.lock().await.get(&1).unwrap().clone();
+        assert_eq!(cafe.current_version().unwrap(), Some(1));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

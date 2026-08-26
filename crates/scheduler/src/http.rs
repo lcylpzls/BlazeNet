@@ -67,6 +67,12 @@ pub struct CreateTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RollbackRequest {
+    node_id: u64,
+    version: u64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct BindRequest {
     kind: String,
     a: u64,
@@ -324,6 +330,54 @@ async fn create_task(
     Ok(Json(task))
 }
 
+/// 回滚指定节点到历史版本：校验版本存在后推送 ROLLBACK 任务并更新游戏当前版本。
+async fn rollback_game(
+    State(state): State<HttpState>,
+    Path(game_id): Path<u64>,
+    Json(request): Json<RollbackRequest>,
+) -> Result<Json<TaskRecord>, StatusCode> {
+    if request.version == 0 {
+        return Err(bad_request());
+    }
+    let Some(mut game) = state.store.get_game(game_id).map_err(store_error)? else {
+        return Err(not_found());
+    };
+    if state
+        .store
+        .get_version(game_id, request.version)
+        .map_err(store_error)?
+        .is_none()
+    {
+        return Err(not_found());
+    }
+    if state
+        .store
+        .get_node(request.node_id)
+        .map_err(store_error)?
+        .is_none()
+    {
+        return Err(not_found());
+    }
+    let task = TaskRecord {
+        id: state.store.next_task_id().map_err(store_error)?,
+        node_id: request.node_id,
+        game_id,
+        version: request.version,
+        kind: "ROLLBACK".to_string(),
+        assigned_chunks: Vec::new(),
+        status: "queued".to_string(),
+        error: String::new(),
+    };
+    state
+        .control
+        .push_task(task.clone())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    game.current_version = request.version;
+    state.store.insert_game(&game).map_err(store_error)?;
+    Ok(Json(task))
+}
+
 async fn delete_game(
     State(state): State<HttpState>,
     Path(id): Path<u64>,
@@ -356,6 +410,7 @@ pub fn router(
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/games", get(list_games).post(create_game))
         .route("/api/games/{id}", delete(delete_game))
+        .route("/api/games/{id}/rollback", post(rollback_game))
         .route("/api/bindings", post(bind))
         .fallback_service(ServeDir::new(web_dir))
         .with_state(HttpState {
@@ -374,15 +429,20 @@ mod tests {
     use std::fs;
     use tower::ServiceExt;
 
-    fn app(dir: &std::path::Path) -> Router {
+    fn app_with_store(dir: &std::path::Path) -> (Router, Arc<Store>) {
         let store = Arc::new(Store::open(&dir.join("data")).unwrap());
-        router(
+        let app = router(
             dir.to_path_buf(),
             "admin".to_string(),
             "secret".to_string(),
             store.clone(),
-            ControlService::new(store),
-        )
+            ControlService::new(store.clone()),
+        );
+        (app, store)
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        app_with_store(dir).0
     }
 
     #[tokio::test]
@@ -838,6 +898,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_api() {
+        let dir = std::env::temp_dir().join("blaze-http-rollback");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (app, store) = app_with_store(&dir);
+        store
+            .insert_game(&GameRecord {
+                id: 1,
+                name: "GameX".to_string(),
+                status: "ready".to_string(),
+                current_version: 2,
+                latest_version: 2,
+            })
+            .unwrap();
+        store.save_version(1, 1, b"v1").unwrap();
+        store.save_version(1, 2, b"v2").unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 1,
+                node_type: "cafe".to_string(),
+                endpoint_id: "ep".to_string(),
+                token: "secret".to_string(),
+                addrs: vec![],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games/1/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":1,"version":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(store.get_game(1).unwrap().unwrap().current_version, 1);
+        let tasks = store.list_tasks().unwrap();
+        assert_eq!(tasks[0].kind, "ROLLBACK");
+        assert_eq!(tasks[0].version, 1);
+
+        let missing_version = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games/1/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":1,"version":99}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_version.status(), StatusCode::NOT_FOUND);
+
+        let zero_version = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games/1/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":1,"version":0}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero_version.status(), StatusCode::BAD_REQUEST);
+
+        let missing_node = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games/1/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":99,"version":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_node.status(), StatusCode::NOT_FOUND);
+
+        let missing_game = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/games/99/rollback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"node_id":1,"version":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_game.status(), StatusCode::NOT_FOUND);
         let _ = fs::remove_dir_all(&dir);
     }
 }
