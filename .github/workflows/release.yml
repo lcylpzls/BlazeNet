@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  # 与 CI 相同的平台边界：Linux 组件只构建 Linux，Windows 组件只构建 Windows
+  build-linux:
+    name: 构建 Linux 交付物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --workspace --exclude producer
+      - name: 收集 bin/linux
+        run: |
+          mkdir -p bin/linux
+          cp target/release/origin target/release/scheduler target/release/agent target/release/relay bin/linux/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux
+          path: bin/linux
+
+  build-windows:
+    name: 构建 Windows 交付物
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p producer -p agent
+      - name: 收集 bin/windows
+        shell: bash
+        run: |
+          mkdir -p bin/windows
+          cp target/release/producer.exe target/release/agent.exe bin/windows/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-windows
+          path: bin/windows
+
+  release:
+    name: 发布 Release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux
+          path: bin/linux
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows
+          path: bin/windows
+      - name: 创建并上传 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" bin/linux/* bin/windows/* --generate-notes

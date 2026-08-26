@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 质量门禁只在 Linux 运行；Windows 侧只构建不测试（不做全平台适配测试）
+  quality:
+    name: 质量门禁（fmt/clippy/test/覆盖率）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: 格式检查
+        run: cargo fmt --all --check
+      - name: Clippy 门禁
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 单元测试
+        run: cargo test --workspace --all-targets
+      - name: 覆盖率门禁（库代码 100%）
+        run: cargo llvm-cov --workspace --lib --fail-under-lines 100
+
+  # Linux 交付物：原始节点、调度中心、agent（IDC 角色）、relay
+  build-linux:
+    name: 构建 Linux 交付物
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译
+        run: cargo build --release --workspace --exclude producer
+      - name: 收集 bin/linux
+        run: |
+          mkdir -p bin/linux
+          cp target/release/origin target/release/scheduler target/release/agent target/release/relay bin/linux/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-linux
+          path: bin/linux
+
+  # Windows 交付物：制作机、agent（网吧服务器角色）
+  build-windows:
+    name: 构建 Windows 交付物
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译
+        run: cargo build --release -p producer -p agent
+      - name: 收集 bin/windows
+        shell: bash
+        run: |
+          mkdir -p bin/windows
+          cp target/release/producer.exe target/release/agent.exe bin/windows/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-windows
+          path: bin/windows

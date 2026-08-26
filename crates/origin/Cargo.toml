@@ -1,0 +1,13 @@
+[package]
+name = "origin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "origin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
