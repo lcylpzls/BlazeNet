@@ -596,6 +596,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cafe_datapath_serves_temp_then_real_file() {
+        let dir = std::env::temp_dir().join("blaze-exec-cafe-dp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_dir = dir.join("seed");
+        let cafe_dir = dir.join("cafe");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&cafe_dir).unwrap();
+        let (seed, hashes) = seed_server(&seed_dir, 1).await;
+        let bytes = manifest(&[("dir/a.bin", b"hello")]);
+        let (url, service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: seed.endpoint_id().to_string(),
+                token: "peer".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", seed.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store.record_chunk_holder(2, 1, &hashes[0]).unwrap();
+        service
+            .push_task(TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+        let (exec, data_stores, _pack, _cafe) =
+            executor(config(NodeType::Cafe, cafe_dir.clone(), url, None, None), 1);
+        exec.run_task(task(1, 1, 1)).await.unwrap();
+
+        // 用网吧数据面（pack_default=false）直接提供块服务。
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let cafe_handle = datapath::serve(
+            data_stores,
+            pack_stores,
+            cafe_dir.clone(),
+            0,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let ep = fetch::build_endpoint(None).await.unwrap();
+        let target = fetch::PeerTarget {
+            endpoint_id: cafe_handle.endpoint_id(),
+            addr: Some(format!("127.0.0.1:{}", cafe_handle.port()).parse().unwrap()),
+            relay_url: None,
+            direct_only: true,
+        };
+
+        // 临时块提供上传。
+        let mut got = Vec::new();
+        let stats = fetch::fetch_chunks(&ep, &target, 1, &hashes[..1], |hash, data| {
+            got.push((hash, data));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats.downloaded, 1);
+        assert_eq!(got[0].1, b"hello");
+
+        // 删除临时块后回退真实文件偏移读。
+        let temp = crate::cafe_store::temp_dir(&cafe_dir, 1);
+        std::fs::remove_file(temp.join(format!("{}.blk", crate::update::hex(&hashes[0])))).unwrap();
+        let mut got2 = Vec::new();
+        let stats2 = fetch::fetch_chunks(&ep, &target, 1, &hashes[..1], |hash, data| {
+            got2.push((hash, data));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(stats2.downloaded, 1);
+        assert_eq!(got2[0].1, b"hello");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        cafe_handle.shutdown();
+        seed.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_task_no_source_and_missing_version() {
         let dir = std::env::temp_dir().join("blaze-exec-err");
         let _ = std::fs::remove_dir_all(&dir);
