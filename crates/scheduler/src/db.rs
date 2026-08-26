@@ -2,6 +2,7 @@
 use anyhow::{Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 
 const NODES: TableDefinition<u64, String> = TableDefinition::new("nodes");
@@ -9,9 +10,20 @@ const TASKS: TableDefinition<u64, String> = TableDefinition::new("tasks");
 const COUNTERS: TableDefinition<String, u64> = TableDefinition::new("counters");
 const CHUNKS: TableDefinition<String, String> = TableDefinition::new("chunks");
 const HEAT: TableDefinition<String, u64> = TableDefinition::new("heat");
+const USERS: TableDefinition<u64, String> = TableDefinition::new("users");
+const PLACES: TableDefinition<u64, String> = TableDefinition::new("places");
+const GROUPS: TableDefinition<u64, String> = TableDefinition::new("groups");
+const BINDINGS: TableDefinition<String, u64> = TableDefinition::new("bindings");
 
 const NEXT_NODE_ID: &str = "next_node_id";
 const NEXT_TASK_ID: &str = "next_task_id";
+const NEXT_USER_ID: &str = "next_user_id";
+const NEXT_PLACE_ID: &str = "next_place_id";
+const NEXT_GROUP_ID: &str = "next_group_id";
+
+const BIND_UP: &str = "user_place";
+const BIND_UG: &str = "user_group";
+const BIND_GP: &str = "group_place";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddrRecord {
@@ -43,6 +55,32 @@ pub struct TaskRecord {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserRecord {
+    pub id: u64,
+    pub username: String,
+    pub password_hash: String,
+    pub salt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlaceRecord {
+    pub id: u64,
+    pub name: String,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupRecord {
+    pub id: u64,
+    pub name: String,
+}
+
+/// 计算密码哈希（BLAKE3(password + salt)）。
+pub fn hash_password(password: &str, salt: &str) -> String {
+    blake3::hash(format!("{salt}:{password}").as_bytes()).to_string()
+}
+
 fn encode<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).context("序列化记录失败")
 }
@@ -60,6 +98,12 @@ fn ensure_tables(db: &Database) -> Result<()> {
         .context("创建 counters 表失败")?;
     write_txn.open_table(CHUNKS).context("创建 chunks 表失败")?;
     write_txn.open_table(HEAT).context("创建 heat 表失败")?;
+    write_txn.open_table(USERS).context("创建 users 表失败")?;
+    write_txn.open_table(PLACES).context("创建 places 表失败")?;
+    write_txn.open_table(GROUPS).context("创建 groups 表失败")?;
+    write_txn
+        .open_table(BINDINGS)
+        .context("创建 bindings 表失败")?;
     write_txn.commit().context("提交建表事务失败")?;
     Ok(())
 }
@@ -268,6 +312,143 @@ impl Store {
         games.sort_by_key(|a| std::cmp::Reverse(a.1));
         Ok(games.into_iter().take(limit).map(|(id, _)| id).collect())
     }
+
+    fn insert_json(&self, table: TableDefinition<u64, String>, id: u64, value: &str) -> Result<()> {
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        {
+            let mut handle = write_txn.open_table(table).context("打开表失败")?;
+            handle
+                .insert(id, value.to_string())
+                .context("写入记录失败")?;
+        }
+        write_txn.commit().context("提交事务失败")?;
+        Ok(())
+    }
+
+    fn get_json(&self, table: TableDefinition<u64, String>, id: u64) -> Result<Option<String>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let handle = read_txn.open_table(table).context("打开表失败")?;
+        Ok(handle.get(id).context("查询记录失败")?.map(|v| v.value()))
+    }
+
+    fn list_json(&self, table: TableDefinition<u64, String>) -> Result<Vec<String>> {
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let handle = read_txn.open_table(table).context("打开表失败")?;
+        let mut values = Vec::new();
+        for item in handle.iter().context("遍历记录失败")? {
+            let (_, value) = item.context("读取记录失败")?;
+            values.push(value.value());
+        }
+        Ok(values)
+    }
+
+    pub fn next_user_id(&self) -> Result<u64> {
+        self.next_id(NEXT_USER_ID)
+    }
+
+    pub fn next_place_id(&self) -> Result<u64> {
+        self.next_id(NEXT_PLACE_ID)
+    }
+
+    pub fn next_group_id(&self) -> Result<u64> {
+        self.next_id(NEXT_GROUP_ID)
+    }
+
+    pub fn insert_user(&self, user: &UserRecord) -> Result<()> {
+        self.insert_json(USERS, user.id, &encode(user)?)
+    }
+
+    pub fn get_user(&self, id: u64) -> Result<Option<UserRecord>> {
+        let Some(text) = self.get_json(USERS, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode(&text)?))
+    }
+
+    pub fn list_users(&self) -> Result<Vec<UserRecord>> {
+        self.list_json(USERS)?
+            .iter()
+            .map(|text| decode(text))
+            .collect()
+    }
+
+    pub fn insert_place(&self, place: &PlaceRecord) -> Result<()> {
+        self.insert_json(PLACES, place.id, &encode(place)?)
+    }
+
+    pub fn get_place(&self, id: u64) -> Result<Option<PlaceRecord>> {
+        let Some(text) = self.get_json(PLACES, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode(&text)?))
+    }
+
+    pub fn list_places(&self) -> Result<Vec<PlaceRecord>> {
+        self.list_json(PLACES)?
+            .iter()
+            .map(|text| decode(text))
+            .collect()
+    }
+
+    pub fn insert_group(&self, group: &GroupRecord) -> Result<()> {
+        self.insert_json(GROUPS, group.id, &encode(group)?)
+    }
+
+    pub fn get_group(&self, id: u64) -> Result<Option<GroupRecord>> {
+        let Some(text) = self.get_json(GROUPS, id)? else {
+            return Ok(None);
+        };
+        Ok(Some(decode(&text)?))
+    }
+
+    pub fn list_groups(&self) -> Result<Vec<GroupRecord>> {
+        self.list_json(GROUPS)?
+            .iter()
+            .map(|text| decode(text))
+            .collect()
+    }
+
+    /// 建立绑定（幂等）。
+    pub fn bind(&self, kind: &str, a: u64, b: u64) -> Result<()> {
+        let key = format!("{kind}/{a}/{b}");
+        let write_txn = self.db.begin_write().context("开始写事务失败")?;
+        {
+            let mut handle = write_txn.open_table(BINDINGS).context("打开绑定表失败")?;
+            handle.insert(key, 1).context("写入绑定失败")?;
+        }
+        write_txn.commit().context("提交绑定事务失败")?;
+        Ok(())
+    }
+
+    fn binding_ids(&self, kind: &str, a: u64) -> Result<Vec<u64>> {
+        let prefix = format!("{kind}/{a}/");
+        let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+        let handle = read_txn.open_table(BINDINGS).context("打开绑定表失败")?;
+        let mut ids = Vec::new();
+        for item in handle.iter().context("遍历绑定失败")? {
+            let (key, _) = item.context("读取绑定失败")?;
+            let key = key.value();
+            if let Some(rest) = key.strip_prefix(&prefix)
+                && let Ok(id) = rest.parse()
+            {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// 用户可见场所 = 直绑 + 所属分组绑定的场所（去重排序）。
+    pub fn places_of_user(&self, user_id: u64) -> Result<Vec<u64>> {
+        let mut places: HashSet<u64> = self.binding_ids(BIND_UP, user_id)?.into_iter().collect();
+        for group in self.binding_ids(BIND_UG, user_id)? {
+            for place in self.binding_ids(BIND_GP, group)? {
+                places.insert(place);
+            }
+        }
+        let mut result: Vec<u64> = places.into_iter().collect();
+        result.sort();
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -392,6 +573,65 @@ mod tests {
         s.add_launch(1, 3).unwrap();
         assert_eq!(s.top_games(10).unwrap(), vec![2, 1]);
         assert_eq!(s.top_games(1).unwrap(), vec![2]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_password_hash() {
+        assert_eq!(hash_password("abc", "s1"), hash_password("abc", "s1"));
+        assert_ne!(hash_password("abc", "s1"), hash_password("abc", "s2"));
+    }
+
+    #[test]
+    fn test_admin_entities_roundtrip() {
+        let dir = std::env::temp_dir().join("blaze-sched-admin");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        assert_eq!(s.next_user_id().unwrap(), 1);
+        assert_eq!(s.next_place_id().unwrap(), 1);
+        assert_eq!(s.next_group_id().unwrap(), 1);
+        let user = UserRecord {
+            id: 1,
+            username: "u1".to_string(),
+            password_hash: hash_password("p", "s"),
+            salt: "s".to_string(),
+        };
+        let place = PlaceRecord {
+            id: 1,
+            name: "网吧A".to_string(),
+            region: "上海".to_string(),
+        };
+        let group = GroupRecord {
+            id: 1,
+            name: "华东组".to_string(),
+        };
+        s.insert_user(&user).unwrap();
+        s.insert_place(&place).unwrap();
+        s.insert_group(&group).unwrap();
+        assert_eq!(s.get_user(1).unwrap(), Some(user));
+        assert_eq!(s.get_place(1).unwrap(), Some(place));
+        assert_eq!(s.get_group(1).unwrap(), Some(group));
+        assert_eq!(s.get_place(99).unwrap(), None);
+        assert_eq!(s.get_group(99).unwrap(), None);
+        assert_eq!(s.list_users().unwrap().len(), 1);
+        assert_eq!(s.list_places().unwrap().len(), 1);
+        assert_eq!(s.list_groups().unwrap().len(), 1);
+        assert_eq!(s.get_user(99).unwrap(), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bindings_places_of_user() {
+        let dir = std::env::temp_dir().join("blaze-sched-bind");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        s.bind(BIND_UP, 1, 10).unwrap();
+        s.bind(BIND_UP, 1, 11).unwrap();
+        s.bind(BIND_UG, 1, 7).unwrap();
+        s.bind(BIND_GP, 7, 20).unwrap();
+        s.bind(BIND_GP, 7, 10).unwrap();
+        assert_eq!(s.places_of_user(1).unwrap(), vec![10, 11, 20]);
+        assert!(s.places_of_user(2).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
