@@ -155,12 +155,38 @@ function StatusPage() {
   );
 }
 
+function AuditPage() {
+  const audits = useList<{
+    id: number;
+    time_ms: number;
+    actor: string;
+    action: string;
+    detail: string;
+  }>('/api/audit');
+  useState(() => {
+    void audits.load();
+  });
+  const columns: ColumnsType<(typeof audits.data)[number]> = [
+    { title: 'ID', dataIndex: 'id' },
+    {
+      title: '时间',
+      dataIndex: 'time_ms',
+      render: (value: number) => new Date(value).toLocaleString(),
+    },
+    { title: '操作人', dataIndex: 'actor' },
+    { title: '动作', dataIndex: 'action' },
+    { title: '详情', dataIndex: 'detail' },
+  ];
+  return <Table rowKey="id" loading={audits.loading} dataSource={audits.data} columns={columns} />;
+}
+
 const PAGES: Record<string, ReactNode> = {
   users: <UsersPage />,
   nodes: <NodesPage />,
   games: <GamesPage />,
   tasks: <TasksPage />,
   status: <StatusPage />,
+  audit: <AuditPage />,
 };
 
 function AdminLayout() {
@@ -171,6 +197,7 @@ function AdminLayout() {
     { key: 'games', label: '游戏管理' },
     { key: 'tasks', label: '任务管理' },
     { key: 'status', label: '基础状态' },
+    { key: 'audit', label: '审计日志' },
   ];
   return (
     <Layout style={{ minHeight: '100vh' }}>

@@ -4,6 +4,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const NODES: TableDefinition<u64, String> = TableDefinition::new("nodes");
 const TASKS: TableDefinition<u64, String> = TableDefinition::new("tasks");
@@ -16,6 +17,7 @@ const GROUPS: TableDefinition<u64, String> = TableDefinition::new("groups");
 const BINDINGS: TableDefinition<String, u64> = TableDefinition::new("bindings");
 const GAMES: TableDefinition<u64, String> = TableDefinition::new("games");
 const VERSIONS: TableDefinition<String, String> = TableDefinition::new("versions");
+const AUDITS: TableDefinition<u64, String> = TableDefinition::new("audits");
 
 const NEXT_NODE_ID: &str = "next_node_id";
 const NEXT_TASK_ID: &str = "next_task_id";
@@ -23,6 +25,7 @@ const NEXT_USER_ID: &str = "next_user_id";
 const NEXT_PLACE_ID: &str = "next_place_id";
 const NEXT_GROUP_ID: &str = "next_group_id";
 const NEXT_GAME_ID: &str = "next_game_id";
+const NEXT_AUDIT_ID: &str = "next_audit_id";
 
 const BIND_UP: &str = "user_place";
 const BIND_UG: &str = "user_group";
@@ -88,6 +91,15 @@ pub struct GameRecord {
     pub latest_version: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub id: u64,
+    pub time_ms: u64,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
 /// 计算密码哈希（BLAKE3(password + salt)）。
 pub fn hash_password(password: &str, salt: &str) -> String {
     blake3::hash(format!("{salt}:{password}").as_bytes()).to_string()
@@ -120,6 +132,7 @@ fn ensure_tables(db: &Database) -> Result<()> {
     write_txn
         .open_table(VERSIONS)
         .context("创建 versions 表失败")?;
+    write_txn.open_table(AUDITS).context("创建 audits 表失败")?;
     write_txn.commit().context("提交建表事务失败")?;
     Ok(())
 }
@@ -396,6 +409,32 @@ impl Store {
         self.next_id(NEXT_GAME_ID)
     }
 
+    /// 记录一条审计日志，返回日志 ID。
+    pub fn add_audit(&self, actor: &str, action: &str, detail: &str) -> Result<u64> {
+        let id = self.next_id(NEXT_AUDIT_ID)?;
+        let time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let record = AuditRecord {
+            id,
+            time_ms,
+            actor: actor.to_string(),
+            action: action.to_string(),
+            detail: detail.to_string(),
+        };
+        self.insert_json(AUDITS, id, &encode(&record)?)?;
+        Ok(id)
+    }
+
+    /// 全部审计日志（按 ID 升序）。
+    pub fn list_audits(&self) -> Result<Vec<AuditRecord>> {
+        self.list_json(AUDITS)?
+            .iter()
+            .map(|text| decode(text))
+            .collect()
+    }
+
     pub fn insert_user(&self, user: &UserRecord) -> Result<()> {
         self.insert_json(USERS, user.id, &encode(user)?)
     }
@@ -614,6 +653,21 @@ mod tests {
         s.insert_task(&task).unwrap();
         assert_eq!(s.tasks_for_node(7).unwrap(), vec![task.clone()]);
         assert!(s.tasks_for_node(8).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_audit_roundtrip() {
+        let dir = std::env::temp_dir().join("blaze-sched-audit");
+        let _ = fs::remove_dir_all(&dir);
+        let s = store(&dir);
+        let id = s.add_audit("admin", "创建账号", "账号 ID 1").unwrap();
+        let audits = s.list_audits().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].id, id);
+        assert_eq!(audits[0].actor, "admin");
+        assert_eq!(audits[0].action, "创建账号");
+        assert!(audits[0].time_ms > 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

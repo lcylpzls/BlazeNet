@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 
 use crate::db::{
-    AddrRecord, GameRecord, GroupRecord, NodeRecord, PlaceRecord, Store, TaskRecord, UserRecord,
-    hash_password,
+    AddrRecord, AuditRecord, GameRecord, GroupRecord, NodeRecord, PlaceRecord, Store, TaskRecord,
+    UserRecord, hash_password,
 };
 use crate::server::ControlService;
 
@@ -125,6 +125,11 @@ fn not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
+/// 写入审计日志（一期固定管理员身份，二期接 RBAC 会话）。
+async fn audit(state: &HttpState, action: &str, detail: &str) {
+    let _ = state.store.add_audit("admin", action, detail);
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -162,6 +167,7 @@ async fn create_user(
         salt,
     };
     state.store.insert_user(&user).map_err(store_error)?;
+    audit(&state, "创建账号", &format!("账号 ID {}", user.id)).await;
     Ok(Json(user))
 }
 
@@ -172,6 +178,7 @@ async fn delete_user(
     if !state.store.delete_user(id).map_err(store_error)? {
         return Err(not_found());
     }
+    audit(&state, "删除账号", &format!("账号 ID {id}")).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -192,6 +199,7 @@ async fn create_place(
         region: request.region,
     };
     state.store.insert_place(&place).map_err(store_error)?;
+    audit(&state, "创建场所", &format!("场所 ID {}", place.id)).await;
     Ok(Json(place))
 }
 
@@ -202,6 +210,7 @@ async fn delete_place(
     if !state.store.delete_place(id).map_err(store_error)? {
         return Err(not_found());
     }
+    audit(&state, "删除场所", &format!("场所 ID {id}")).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -221,6 +230,7 @@ async fn create_group(
         name: request.name,
     };
     state.store.insert_group(&group).map_err(store_error)?;
+    audit(&state, "创建分组", &format!("分组 ID {}", group.id)).await;
     Ok(Json(group))
 }
 
@@ -231,6 +241,7 @@ async fn delete_group(
     if !state.store.delete_group(id).map_err(store_error)? {
         return Err(not_found());
     }
+    audit(&state, "删除分组", &format!("分组 ID {id}")).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -248,6 +259,12 @@ async fn bind(
         .store
         .bind(&request.kind, request.a, request.b)
         .map_err(store_error)?;
+    audit(
+        &state,
+        "建立绑定",
+        &format!("{} {}/{}", request.kind, request.a, request.b),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -278,6 +295,10 @@ async fn list_games(State(state): State<HttpState>) -> Result<Json<Vec<GameRecor
     state.store.list_games().map_err(store_error).map(Json)
 }
 
+async fn list_audits(State(state): State<HttpState>) -> Result<Json<Vec<AuditRecord>>, StatusCode> {
+    state.store.list_audits().map_err(store_error).map(Json)
+}
+
 async fn create_game(
     State(state): State<HttpState>,
     Json(request): Json<CreateGameRequest>,
@@ -293,6 +314,7 @@ async fn create_game(
         latest_version: 0,
     };
     state.store.insert_game(&game).map_err(store_error)?;
+    audit(&state, "创建游戏", &format!("游戏 ID {}", game.id)).await;
     Ok(Json(game))
 }
 
@@ -327,6 +349,15 @@ async fn create_task(
         .push_task(task.clone())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    audit(
+        &state,
+        "创建任务",
+        &format!(
+            "任务 ID {} 游戏 {} 版本 {}",
+            task.id, task.game_id, task.version
+        ),
+    )
+    .await;
     Ok(Json(task))
 }
 
@@ -375,6 +406,12 @@ async fn rollback_game(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     game.current_version = request.version;
     state.store.insert_game(&game).map_err(store_error)?;
+    audit(
+        &state,
+        "回滚游戏",
+        &format!("游戏 {game_id} 回滚到版本 {}", request.version),
+    )
+    .await;
     Ok(Json(task))
 }
 
@@ -385,6 +422,7 @@ async fn delete_game(
     if !state.store.delete_game(id).map_err(store_error)? {
         return Err(not_found());
     }
+    audit(&state, "删除游戏", &format!("游戏 ID {id}")).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -409,6 +447,7 @@ pub fn router(
         .route("/api/nodes", get(list_nodes))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/games", get(list_games).post(create_game))
+        .route("/api/audit", get(list_audits))
         .route("/api/games/{id}", delete(delete_game))
         .route("/api/games/{id}/rollback", post(rollback_game))
         .route("/api/bindings", post(bind))
@@ -1003,6 +1042,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_game.status(), StatusCode::NOT_FOUND);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_audit_logged_and_listed() {
+        let dir = std::env::temp_dir().join("blaze-http-audit");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let app = app(&dir);
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"alice","password":"pw"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let listed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/audit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(listed.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("创建账号"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
