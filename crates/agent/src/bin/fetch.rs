@@ -10,8 +10,10 @@ const ALPN: &[u8] = b"blazenet/1";
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 && args.len() != 6 {
-        anyhow::bail!("用法: fetch <端点ID> <ip:port> <game_id> <块哈希hex> [relay_url]");
+    if args.len() != 5 && args.len() != 6 && args.len() != 7 {
+        anyhow::bail!(
+            "用法: fetch <端点ID> <ip:port|relay_url> <game_id> <块哈希hex> [relay_url] [本端通告地址]"
+        );
     }
     let endpoint_id: iroh::EndpointId = args[1].parse()?;
     let game_id: u64 = args[3].parse()?;
@@ -21,12 +23,22 @@ async fn main() -> Result<()> {
     } else {
         args.get(5).cloned()
     };
+    let external_addr = args
+        .get(6)
+        .map(|s| s.parse::<std::net::SocketAddr>())
+        .transpose()?;
 
     let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
-        .clear_ip_transports()
-        .bind_addr("0.0.0.0:0")?;
+        .clear_ip_transports();
+    builder = if let Some(addr) = external_addr {
+        builder
+            .external_addr(addr)
+            .bind_addr(format!("0.0.0.0:{}", addr.port()))?
+    } else {
+        builder.bind_addr("0.0.0.0:0")?
+    };
     let target = if let Some(url) = relay_url {
         let relay: iroh::RelayUrl = url.parse()?;
         builder = builder
@@ -42,12 +54,24 @@ async fn main() -> Result<()> {
     };
     let ep = builder.bind().await?;
     let conn = ep.connect(target, ALPN).await.context("连接失败")?;
-    let paths = conn.paths();
-    println!(
-        "连接路径：direct={} relay={}",
-        paths.iter().any(|p| p.is_ip()),
-        paths.iter().any(|p| p.is_relay())
-    );
+    // NAT 打洞的直连路径迁移需要时间，等待直连建立后再请求数据。
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let paths = conn.paths();
+        let direct = paths.iter().any(|p| p.is_ip());
+        let relay = paths.iter().any(|p| p.is_relay());
+        println!(
+            "路径状态：direct={direct} relay={relay} 路径数={}",
+            paths.len()
+        );
+        if direct {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("等待直连路径超时（20 秒）");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi 失败")?;
     send.write_u64(game_id).await?;
     send.write_u32(1).await?;

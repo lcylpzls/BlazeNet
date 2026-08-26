@@ -27,11 +27,47 @@ pub fn reject_relay_only(has_direct: bool, has_relay: bool) -> Result<()> {
     Ok(())
 }
 
+/// 路径门控：直连路径未就绪时拒绝块传输（供连接处理与单元测试共用）。
+pub fn gate_or_reject(ready: bool) -> Result<()> {
+    if !ready {
+        reject_relay_only(false, true)?;
+    }
+    Ok(())
+}
+
+/// 等待直连路径出现；`check` 返回（是否有直连，是否还有 relay 路径）。
+/// 直连出现返回 true；连接失去 relay 路径或超时返回 false。
+async fn wait_for_direct_path<F>(mut check: F, timeout: std::time::Duration) -> bool
+where
+    F: FnMut() -> (bool, bool),
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let (has_direct, has_relay) = check();
+        if has_direct {
+            return true;
+        }
+        if !has_relay || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn handle_conn(conn: Connection, data_dir: PathBuf) -> Result<()> {
-    let paths = conn.paths();
-    let has_direct = paths.iter().any(|p| p.is_ip());
-    let has_relay = paths.iter().any(|p| p.is_relay());
-    reject_relay_only(has_direct, has_relay)?;
+    // NAT 打洞的直连路径可能延迟数秒建立，等待直连后再放行数据。
+    let ready = wait_for_direct_path(
+        || {
+            let paths = conn.paths();
+            (
+                paths.iter().any(|p| p.is_ip()),
+                paths.iter().any(|p| p.is_relay()),
+            )
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    gate_or_reject(ready)?;
     let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi 失败")?;
     let game_id = recv.read_u64().await.context("读 game_id 失败")?;
     let count = recv.read_u32().await.context("读块数失败")?;
@@ -256,5 +292,37 @@ mod tests {
         assert!(!allow_data(false, false));
         assert!(reject_relay_only(false, true).is_ok());
         assert!(reject_relay_only(true, false).is_ok());
+        assert!(gate_or_reject(true).is_ok());
+        assert!(gate_or_reject(false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_direct_path_immediate() {
+        assert!(wait_for_direct_path(|| (true, false), Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_direct_path_delayed() {
+        let mut calls = 0;
+        let ready = wait_for_direct_path(
+            || {
+                calls += 1;
+                (calls >= 2, true)
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(ready);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_direct_path_timeout() {
+        assert!(!wait_for_direct_path(|| (false, true), Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_direct_path_relay_lost() {
+        assert!(!wait_for_direct_path(|| (false, false), Duration::from_secs(1)).await);
     }
 }
