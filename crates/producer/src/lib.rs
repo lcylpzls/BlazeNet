@@ -130,16 +130,15 @@ pub fn run_with_config(path: &Path) -> Result<()> {
                 blaze_proto::upload::upload_client::UploadClient::connect(addr.clone())
                     .await
                     .context(format!("连接原始节点失败: {addr}"))?;
-            let mut chunks = Vec::new();
-            for hash in &plan.chunks_to_download {
-                let path = stage_dir.join(format!("{}.blk", chunker::hex(hash)));
-                let data =
-                    std::fs::read(&path).context(format!("读取暂存块失败: {}", path.display()))?;
-                chunks.push((*hash, data));
-            }
-            let summary =
-                upload::upload_delta(&mut client, config.game_id, chunks, &config.origin_token)
-                    .await?;
+            // 流式上传：边读暂存块边发送，避免全部差异块载入内存。
+            let summary = upload::upload_delta(
+                &mut client,
+                config.game_id,
+                &stage_dir,
+                &plan.chunks_to_download,
+                &config.origin_token,
+            )
+            .await?;
             upload::commit_version(
                 &mut client,
                 config.game_id,

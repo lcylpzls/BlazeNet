@@ -1,12 +1,16 @@
 //! 制作机上传客户端：秒传查重、流式上传、版本提交。
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use blaze_proto::upload::upload_client::UploadClient;
-use blaze_proto::upload::{ChunkQuery, CommitRequest, UploadAck, UploadChunk};
+use blaze_proto::upload::{ChunkQuery, CommitRequest, UploadChunk};
+use std::path::Path;
 use std::str::FromStr;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
+
+use crate::chunker::hex;
 
 /// 上传结果汇总。
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -45,31 +49,6 @@ pub async fn query_existing(
         .collect())
 }
 
-/// 流式上传块，返回服务端确认。
-pub async fn upload_chunks(
-    client: &mut UploadClient<Channel>,
-    game_id: u64,
-    chunks: Vec<([u8; 32], Vec<u8>)>,
-    token: &Option<String>,
-) -> Result<Vec<UploadAck>> {
-    let stream = tokio_stream::iter(chunks.into_iter().enumerate().map(
-        move |(seq, (hash, data))| UploadChunk {
-            game_id,
-            chunk_hash: hash.to_vec(),
-            data,
-            seq: seq as u32,
-        },
-    ));
-    let mut request = Request::new(stream);
-    attach_token(&mut request, token)?;
-    let mut response = client.upload_chunks(request).await?.into_inner();
-    let mut acks = Vec::new();
-    while let Some(ack) = response.next().await {
-        acks.push(ack?);
-    }
-    Ok(acks)
-}
-
 /// 提交版本清单；未发布时返回错误。
 pub async fn commit_version(
     client: &mut UploadClient<Channel>,
@@ -94,25 +73,57 @@ pub async fn commit_version(
     }
 }
 
-/// 完整上传流程：查重 → 上传缺失块 → 汇总。
+/// 完整上传流程：查重 → 流式上传缺失块（边读暂存文件边发送，内存仅保留单个块）→ 汇总。
 pub async fn upload_delta(
     client: &mut UploadClient<Channel>,
     game_id: u64,
-    chunks: Vec<([u8; 32], Vec<u8>)>,
+    stage_dir: &Path,
+    hashes: &[[u8; 32]],
     token: &Option<String>,
 ) -> Result<UploadSummary> {
-    let hashes: Vec<[u8; 32]> = chunks.iter().map(|(h, _)| *h).collect();
-    let existing = query_existing(client, game_id, &hashes, token).await?;
-    let to_upload: Vec<_> = chunks
-        .into_iter()
-        .filter(|(h, _)| !existing.contains(h))
+    let existing = query_existing(client, game_id, hashes, token).await?;
+    let missing: Vec<[u8; 32]> = hashes
+        .iter()
+        .filter(|h| !existing.contains(h))
+        .copied()
         .collect();
-    let acks = upload_chunks(client, game_id, to_upload, token).await?;
     let mut summary = UploadSummary {
         skipped: existing.len(),
         ..Default::default()
     };
-    for ack in acks {
+    if missing.is_empty() {
+        return Ok(summary);
+    }
+    let stage = stage_dir.to_path_buf();
+    for hash in &missing {
+        let path = stage.join(format!("{}.blk", hex(hash)));
+        if !path.exists() {
+            bail!("暂存块缺失: {}", path.display());
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let _task = tokio::spawn(async move {
+        for (seq, hash) in missing.iter().enumerate() {
+            let path = stage.join(format!("{}.blk", hex(hash)));
+            // 已预检存在；读取异常时该块缺失，提交阶段会因缺块失败兜底。
+            if let Ok(data) = tokio::fs::read(&path).await {
+                let _ = tx
+                    .send(UploadChunk {
+                        game_id,
+                        chunk_hash: hash.to_vec(),
+                        data,
+                        seq: seq as u32,
+                    })
+                    .await;
+            }
+        }
+    });
+    let stream = ReceiverStream::new(rx);
+    let mut request = Request::new(stream);
+    attach_token(&mut request, token)?;
+    let mut response = client.upload_chunks(request).await?.into_inner();
+    while let Some(ack) = response.next().await {
+        let ack = ack?;
         if ack.ok {
             summary.uploaded += 1;
         } else {
@@ -180,29 +191,23 @@ mod tests {
         let h1 = hash_of(&d1);
         let h2 = hash_of(&d2);
         let token = Some("test-token".to_string());
+        let stage = dir.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(format!("{}.blk", hex(&h1))), &d1).unwrap();
+        fs::write(stage.join(format!("{}.blk", hex(&h2))), &d2).unwrap();
 
         // 第一次：两个块都上传
-        let summary = upload_delta(
-            &mut client,
-            1,
-            vec![(h1, d1.clone()), (h2, d2.clone())],
-            &token,
-        )
-        .await
-        .unwrap();
+        let summary = upload_delta(&mut client, 1, &stage, &[h1, h2], &token)
+            .await
+            .unwrap();
         assert_eq!(summary.uploaded, 2);
         assert_eq!(summary.skipped, 0);
         assert!(summary.failed.is_empty());
 
         // 第二次：两个块都秒传跳过
-        let summary = upload_delta(
-            &mut client,
-            1,
-            vec![(h1, d1.clone()), (h2, d2.clone())],
-            &token,
-        )
-        .await
-        .unwrap();
+        let summary = upload_delta(&mut client, 1, &stage, &[h1, h2], &token)
+            .await
+            .unwrap();
         assert_eq!(summary.uploaded, 0);
         assert_eq!(summary.skipped, 2);
 
@@ -236,7 +241,10 @@ mod tests {
 
         // 哈希与数据不匹配 → 服务端 ack ok=false
         let wrong = [7u8; 32];
-        let summary = upload_delta(&mut client, 1, vec![(wrong, b"data".to_vec())], &token)
+        let stage = dir.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join(format!("{}.blk", hex(&wrong))), b"data").unwrap();
+        let summary = upload_delta(&mut client, 1, &stage, &[wrong], &token)
             .await
             .unwrap();
         assert_eq!(summary.failed, vec![wrong]);
@@ -274,6 +282,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Token"));
+        let _ = shutdown.send(());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upload_missing_staged_chunk() {
+        let dir = std::env::temp_dir().join("blaze-producer-missing");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (url, shutdown) = spawn_origin(&dir);
+        let mut client = connect(&url).await.unwrap();
+        let stage = dir.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        let missing = [9u8; 32];
+        let err = upload_delta(&mut client, 1, &stage, &[missing], &None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("暂存块缺失"));
+        let _ = shutdown.send(());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_upload_staged_chunk_read_error() {
+        let dir = std::env::temp_dir().join("blaze-producer-readerr");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (url, shutdown) = spawn_origin(&dir);
+        let mut client = connect(&url).await.unwrap();
+        let stage = dir.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        // 预检通过但读取失败：同名目录会让 exists() 为真而 fs::read 报错。
+        let bad = [10u8; 32];
+        fs::create_dir(stage.join(format!("{}.blk", hex(&bad)))).unwrap();
+        let summary = upload_delta(&mut client, 1, &stage, &[bad], &None)
+            .await
+            .unwrap();
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.skipped, 0);
         let _ = shutdown.send(());
         let _ = fs::remove_dir_all(&dir);
     }

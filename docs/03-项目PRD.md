@@ -161,4 +161,4 @@
 
 ### 二期（记录，不开发）
 
-- 预热拉块、动态抢占、不上传降速下载、Prometheus/Grafana、RBAC、openraft 跨机房 HA、远程自升级、Redis、文件级差分（按需）、1GB 分段压缩（按需）、文件重命名/内容级复用识别、前后端分离（前端 Nginx 独立部署 + 反向代理后端接口）。
+- 预热拉块、动态抢占、不上传降速下载、Prometheus/Grafana、RBAC、openraft 跨机房 HA、远程自升级、Redis、文件级差分（按需）、1GB 分段压缩（按需）、文件重命名/内容级复用识别、前后端分离（前端 Nginx 独立部署 + 反向代理后端接口）、compio 运行时替换高 IO 路径（io_uring/IOCP 评估）。

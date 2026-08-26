@@ -2,6 +2,7 @@
 //! 设计见 docs/06-数据存储设计文档.md §3.2。
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -80,7 +81,9 @@ fn write_new_file(
     let new_path = target.with_extension("new");
     let parent = new_path.parent().context("缺少父目录")?;
     fs::create_dir_all(parent).context("创建父目录失败")?;
-    let mut assembled = Vec::new();
+    // 流式拼装：逐块写入临时文件并增量哈希，避免整文件载入内存。
+    let mut out = fs::File::create(&new_path).context("创建临时文件失败")?;
+    let mut hasher = blake3::Hasher::new();
     for chunk in &entry.chunks {
         let data = if let (Some(old_file), Some(map)) = (old_file, old_chunks) {
             if let Some((offset, len)) = map.get(&chunk.hash) {
@@ -93,13 +96,16 @@ fn write_new_file(
             fs::read(temp_dir.join(format!("{}.blk", hex(&chunk.hash))))
                 .context("读取临时块失败")?
         };
-        assembled.extend_from_slice(&data);
+        hasher.update(&data);
+        out.write_all(&data).context("写入临时文件失败")?;
     }
-    let actual: [u8; 32] = blake3::hash(&assembled).into();
+    let actual: [u8; 32] = hasher.finalize().into();
     if actual != entry.file_hash {
+        drop(out);
+        let _ = fs::remove_file(&new_path);
         return Err(anyhow!("文件哈希校验失败"));
     }
-    fs::write(&new_path, &assembled).context("写入临时文件失败")?;
+    out.sync_all().context("同步临时文件失败")?;
     if target.exists() {
         fs::remove_file(&target).context("删除旧文件失败")?;
     }
