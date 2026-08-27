@@ -123,14 +123,22 @@ pub struct ControlService {
     store: Arc<Store>,
     pending: Arc<Mutex<HashMap<u64, VecDeque<TaskEvent>>>>,
     notify: Arc<Notify>,
+    events: tokio::sync::broadcast::Sender<String>,
 }
 
 impl ControlService {
     pub fn new(store: Arc<Store>) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        Self::with_events(store, events)
+    }
+
+    /// 指定事件广播通道（HTTP SSE 与 gRPC 任务事件共用）。
+    pub fn with_events(store: Arc<Store>, events: tokio::sync::broadcast::Sender<String>) -> Self {
         Self {
             store,
             pending: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
+            events,
         }
     }
 
@@ -149,6 +157,15 @@ impl ControlService {
             .or_default()
             .push_back(event);
         self.notify.notify_waiters();
+        let _ = self.events.send(
+            serde_json::json!({
+                "kind": "task",
+                "id": task.id,
+                "node_id": task.node_id,
+                "game_id": task.game_id
+            })
+            .to_string(),
+        );
         Ok(())
     }
 }
@@ -244,6 +261,14 @@ impl Control for ControlService {
         self.store
             .update_task_status(report.task_id, &report.status, &report.error)
             .map_err(update_task_error)?;
+        let _ = self.events.send(
+            serde_json::json!({
+                "kind": "task_status",
+                "task_id": report.task_id,
+                "status": report.status
+            })
+            .to_string(),
+        );
         Ok(Response::new(Empty {}))
     }
 
@@ -854,5 +879,30 @@ mod tests {
         assert_eq!(peers.peers.len(), 1);
         assert_eq!(peers.peers[0].node_id, 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_events_broadcast_on_push_and_report() {
+        let dir = std::env::temp_dir().join("blaze-events-broadcast");
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::open(&dir).unwrap());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let service = ControlService::with_events(store.clone(), tx);
+        service.push_task(task_record(1, 1)).await.unwrap();
+        let msg: String = rx.recv().await.unwrap();
+        assert!(msg.contains("\"kind\":\"task\""));
+        service
+            .report_task(Request::new(TaskReport {
+                node_id: 1,
+                task_id: 1,
+                status: "done".to_string(),
+                error: String::new(),
+            }))
+            .await
+            .unwrap();
+        let msg: String = rx.recv().await.unwrap();
+        assert!(msg.contains("\"kind\":\"task_status\""));
+        assert!(msg.contains("\"status\":\"done\""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

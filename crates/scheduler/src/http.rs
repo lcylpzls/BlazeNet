@@ -25,6 +25,7 @@ pub struct HttpState {
     admin_password: String,
     store: Arc<Store>,
     control: ControlService,
+    events: tokio::sync::broadcast::Sender<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +185,26 @@ async fn metrics(State(state): State<HttpState>) -> String {
         games,
         audits
     )
+}
+
+/// 三期 P3.5b：SSE 增量事件推送（任务创建/状态变化/取消），前端订阅后按需刷新。
+async fn events_stream(State(state): State<HttpState>) -> axum::response::Response {
+    use axum::body::Body;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+    let rx = state.events.subscribe();
+    let stream = BroadcastStream::new(rx).map(|item| {
+        let data = match item {
+            Ok(text) => format!("data: {text}\n\n"),
+            Err(_) => "data: {}\n\n".to_string(),
+        };
+        Ok::<_, std::convert::Infallible>(data)
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("SSE 响应构造失败")
 }
 
 async fn login(
@@ -498,6 +519,14 @@ async fn cancel_task(
         .store
         .update_task_status(id, "cancelled", "人工取消")
         .map_err(store_error)?;
+    let _ = state.events.send(
+        serde_json::json!({
+            "kind": "task_status",
+            "task_id": id,
+            "status": "cancelled"
+        })
+        .to_string(),
+    );
     audit(
         &state,
         "取消任务",
@@ -525,10 +554,12 @@ pub fn router(
     admin_password: String,
     store: Arc<Store>,
     control: ControlService,
+    events: tokio::sync::broadcast::Sender<String>,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
+        .route("/api/events", get(events_stream))
         .route("/api/login", post(login))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{id}", delete(delete_user))
@@ -551,6 +582,7 @@ pub fn router(
             admin_password,
             store,
             control,
+            events,
         })
 }
 
@@ -564,12 +596,14 @@ mod tests {
 
     fn app_with_store(dir: &std::path::Path) -> (Router, Arc<Store>) {
         let store = Arc::new(Store::open(&dir.join("data")).unwrap());
+        let (events, _) = tokio::sync::broadcast::channel(256);
         let app = router(
             dir.to_path_buf(),
             "admin".to_string(),
             "secret".to_string(),
             store.clone(),
             ControlService::new(store.clone()),
+            events,
         );
         (app, store)
     }
@@ -593,6 +627,134 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_events_sse_headers() {
+        let dir = std::env::temp_dir().join("blaze-http-sse");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let response = app(&dir)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-cache");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_events_sse_receives_event() {
+        let dir = std::env::temp_dir().join("blaze-http-sse-event");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("data")).unwrap());
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let control = ControlService::with_events(store.clone(), tx.clone());
+        let app = router(
+            dir.clone(),
+            "admin".to_string(),
+            "secret".to_string(),
+            store.clone(),
+            control.clone(),
+            tx,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        control
+            .push_task(TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+        use http_body_util::BodyExt;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame())
+            .await
+            .expect("等待 SSE 事件超时")
+            .unwrap()
+            .unwrap();
+        let bytes = frame.into_data().unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.starts_with("data: "));
+        assert!(text.contains("\"kind\":\"task\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_events_sse_lagged_keepalive() {
+        let dir = std::env::temp_dir().join("blaze-http-sse-lag");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir.join("data")).unwrap());
+        let (tx, _) = tokio::sync::broadcast::channel(4);
+        let control = ControlService::with_events(store.clone(), tx.clone());
+        let app = router(
+            dir.clone(),
+            "admin".to_string(),
+            "secret".to_string(),
+            store.clone(),
+            control.clone(),
+            tx,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        // 订阅后不消费，连续推送超过通道容量的事件触发 Lagged 分支。
+        for id in 1..=8u64 {
+            control
+                .push_task(TaskRecord {
+                    id,
+                    node_id: 1,
+                    game_id: 1,
+                    version: 1,
+                    kind: "UPDATE".to_string(),
+                    assigned_chunks: vec![],
+                    status: "queued".to_string(),
+                    error: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+        use http_body_util::BodyExt;
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame())
+            .await
+            .expect("等待 Lagged 事件超时")
+            .unwrap()
+            .unwrap();
+        let bytes = frame.into_data().unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "data: {}\n\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1044,12 +1206,14 @@ mod tests {
                 error: String::new(),
             })
             .unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(256);
         let app = router(
             dir.clone(),
             "admin".to_string(),
             "secret".to_string(),
             store.clone(),
             ControlService::new(store),
+            events,
         );
         for uri in ["/api/nodes", "/api/tasks", "/api/games"] {
             let response = app

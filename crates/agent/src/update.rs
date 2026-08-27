@@ -2,7 +2,6 @@
 //! 设计见 docs/06-数据存储设计文档.md §3.2。
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -105,8 +104,9 @@ fn write_new_file(
     let new_path = target.with_extension("new");
     let parent = new_path.parent().context("缺少父目录")?;
     fs::create_dir_all(parent).context("创建父目录失败")?;
-    // 流式拼装：逐块写入临时文件并增量哈希，避免整文件载入内存。
-    let mut out = fs::File::create(&new_path).context("创建临时文件失败")?;
+    // 三期 P3.4b：拼装写盘走 compio（io_uring/IOCP）顺序写，逐块增量哈希，整文件不载入内存。
+    let mut out =
+        blaze_common::compio_io::CompioWriter::create(&new_path).context("创建临时文件失败")?;
     let mut hasher = blake3::Hasher::new();
     let old_handle = old_file
         .filter(|p| p.is_file())
@@ -140,15 +140,16 @@ fn write_new_file(
                 .context("读取临时块失败")?
         };
         hasher.update(&data);
-        out.write_all(&data).context("写入临时文件失败")?;
+        out.write_owned(data).context("写入临时文件失败")?;
     }
     let actual: [u8; 32] = hasher.finalize().into();
     if actual != entry.file_hash {
-        drop(out);
+        let _ = out.close();
         let _ = fs::remove_file(&new_path);
         return Err(anyhow!("文件哈希校验失败"));
     }
     out.sync_all().context("同步临时文件失败")?;
+    out.close().context("关闭临时文件失败")?;
     if target.exists() {
         fs::remove_file(&target).context("删除旧文件失败")?;
     }

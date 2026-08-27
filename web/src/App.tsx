@@ -9,6 +9,7 @@ const GamesPage = lazy(() => import('./pages/GamesPage'));
 const TasksPage = lazy(() => import('./pages/TasksPage'));
 const StatusPage = lazy(() => import('./pages/StatusPage'));
 const AuditPage = lazy(() => import('./pages/AuditPage'));
+const MetricsPage = lazy(() => import('./pages/MetricsPage'));
 
 const { Sider, Content, Header } = Layout;
 
@@ -19,6 +20,7 @@ const PAGES: Record<string, ComponentType> = {
   tasks: TasksPage,
   status: StatusPage,
   audit: AuditPage,
+  metrics: MetricsPage,
 };
 
 function PageView({ page }: { page: ComponentType }) {
@@ -35,6 +37,7 @@ function AdminLayout() {
     { key: 'tasks', label: '任务管理' },
     { key: 'status', label: '基础状态' },
     { key: 'audit', label: '审计日志' },
+    { key: 'metrics', label: '指标大盘' },
   ];
   return (
     <Layout style={{ minHeight: '100vh' }}>

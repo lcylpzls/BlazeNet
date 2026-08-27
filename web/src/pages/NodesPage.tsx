@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Table, Tag } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import { subscribeEvents } from '../api';
 import { useList } from '../list';
 
 type NodeRow = { id: number; node_type: string; endpoint_id: string; status: string };
@@ -10,6 +11,13 @@ export default function NodesPage() {
   useState(() => {
     void nodes.load();
   });
+  useEffect(
+    () =>
+      subscribeEvents(() => {
+        void nodes.load();
+      }),
+    [],
+  );
   const columns: ColumnsType<NodeRow> = [
     { title: 'ID', dataIndex: 'id' },
     { title: '类型', dataIndex: 'node_type' },

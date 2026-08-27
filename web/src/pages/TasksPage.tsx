@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Card, Form, InputNumber, Select, Table, message } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { api } from '../api';
+import { api, subscribeEvents } from '../api';
 import { useList } from '../list';
 
 type TaskRow = { id: number; node_id: number; game_id: number; status: string };
@@ -16,6 +16,15 @@ export default function TasksPage() {
     void nodes.load();
     void games.load();
   });
+  useEffect(
+    () =>
+      subscribeEvents(() => {
+        void tasks.load();
+        void nodes.load();
+        void games.load();
+      }),
+    [],
+  );
   const columns: ColumnsType<TaskRow> = [
     { title: 'ID', dataIndex: 'id' },
     { title: '节点', dataIndex: 'node_id' },

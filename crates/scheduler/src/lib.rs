@@ -37,7 +37,8 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
 
     let (backup_shutdown, backup_tasks) = start_backup(&config, store.clone()).await?;
 
-    let control = server::ControlService::new(store.clone());
+    let (events_tx, _) = tokio::sync::broadcast::channel(256);
+    let control = server::ControlService::with_events(store.clone(), events_tx.clone());
     let grpc_handle = server::serve(config.bind_socket_addr()?, control.clone())
         .await
         .context("启动控制面 gRPC 服务失败")?;
@@ -65,6 +66,7 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
         config.admin_password.clone(),
         store.clone(),
         control,
+        events_tx,
     );
     let (http_tx, http_rx) = tokio::sync::oneshot::channel();
     let http_task = tokio::spawn(async move {

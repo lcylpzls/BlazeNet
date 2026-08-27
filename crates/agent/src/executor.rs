@@ -125,7 +125,8 @@ impl TaskExecutor {
             .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
             .collect();
         let pending: Arc<StdMutex<PendingBatch>> = Arc::new(StdMutex::new(Vec::new()));
-        let flush_pending = |pending: &Arc<StdMutex<PendingBatch>>| -> Result<()> {
+        let store = store.clone();
+        let flush_pending = Arc::new(move |pending: &Arc<StdMutex<PendingBatch>>| -> Result<()> {
             let batch = std::mem::take(&mut *pending.lock().expect("块库缓冲锁不应被污染"));
             if batch.is_empty() {
                 return Ok(());
@@ -133,15 +134,19 @@ impl TaskExecutor {
             let mut guard = store.lock().expect("块库锁不应被污染");
             guard.append_chunks_batch(&batch)?;
             Ok(())
-        };
-        self.download_missing(client, game_id, missing, &assigned, |hash, data| {
-            let mut batch = pending.lock().expect("块库缓冲锁不应被污染");
-            batch.push((hash, data));
-            if batch.len() >= IDC_BATCH_SIZE {
-                drop(batch);
-                flush_pending(&pending)?;
+        });
+        self.download_missing(client, game_id, missing, &assigned, {
+            let pending = pending.clone();
+            let flush_pending = flush_pending.clone();
+            move |hash, data| {
+                let mut batch = pending.lock().expect("块库缓冲锁不应被污染");
+                batch.push((hash, data));
+                if batch.len() >= IDC_BATCH_SIZE {
+                    drop(batch);
+                    flush_pending(&pending)?;
+                }
+                Ok(())
             }
-            Ok(())
         })
         .await?;
         flush_pending(&pending)?;
@@ -203,10 +208,13 @@ impl TaskExecutor {
             game_id,
             plan.chunks_to_download.clone(),
             &HashSet::new(),
-            |hash, data| {
-                std::fs::write(temp_dir.join(format!("{}.blk", update::hex(&hash))), data)
-                    .context("写入临时块失败")?;
-                Ok(())
+            {
+                let temp_dir = temp_dir.clone();
+                move |hash, data| {
+                    std::fs::write(temp_dir.join(format!("{}.blk", update::hex(&hash))), data)
+                        .context("写入临时块失败")?;
+                    Ok(())
+                }
             },
         )
         .await?;
@@ -228,10 +236,10 @@ impl TaskExecutor {
         game_id: u64,
         missing: Vec<[u8; 32]>,
         assigned: &HashSet<[u8; 32]>,
-        mut sink: F,
+        sink: F,
     ) -> Result<Vec<[u8; 32]>>
     where
-        F: FnMut([u8; 32], Vec<u8>) -> Result<()>,
+        F: FnMut([u8; 32], Vec<u8>) -> Result<()> + Send + 'static,
     {
         if missing.is_empty() {
             return Ok(Vec::new());
@@ -289,11 +297,13 @@ impl TaskExecutor {
             _ => None,
         };
         // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
-        let direct_ep = fetch::build_endpoint(None).await?;
+        let direct_ep = Arc::new(fetch::build_endpoint(None).await?);
         let rate = self.config.download_mbps;
         let started = Instant::now();
         let mut total_bytes = 0u64;
-        let mut downloaded = Vec::new();
+        let mut downloaded_out = Vec::new();
+        let downloaded: Arc<StdMutex<Vec<[u8; 32]>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink_shared = Arc::new(StdMutex::new(sink));
         let mut retry = Vec::new();
         let mut blocked = Vec::new();
         for hash in fallback {
@@ -303,16 +313,33 @@ impl TaskExecutor {
                 blocked.push(hash);
             }
         }
+        // 三期 P3.3：多源并发拉取——不同候选源/地址组并行下载，受 source_permits 限制；
+        // 落盘仍由调用方 sink 串行执行，保证块库写入有序。
+        let mut tasks = tokio::task::JoinSet::new();
         for (target, hashes) in groups {
             let _permit = self.source_permits.acquire().await;
             let ep = Self::choose_ep(&target, &direct_ep)?;
-            match fetch::fetch_chunks(ep, &target, game_id, &hashes, |hash, data| {
-                sink(hash, data)?;
-                downloaded.push(hash);
-                Ok(())
-            })
-            .await
-            {
+            let ep = ep.clone();
+            let sink_shared = sink_shared.clone();
+            let downloaded = downloaded.clone();
+            tasks.spawn(async move {
+                let result = fetch::fetch_chunks(&ep, &target, game_id, &hashes, {
+                    let sink_shared = sink_shared.clone();
+                    let downloaded = downloaded.clone();
+                    move |hash, data| {
+                        let mut sink = sink_shared.lock().expect("下载写入闭包锁不应被污染");
+                        sink(hash, data)?;
+                        downloaded.lock().expect("下载记录锁不应被污染").push(hash);
+                        Ok(())
+                    }
+                })
+                .await;
+                (hashes, result)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (hashes, result) = joined.context("并发下载任务异常")?;
+            match result {
                 Ok(stats) => {
                     Self::throttle(rate, &mut total_bytes, stats.bytes, started).await;
                     for hash in stats.failed {
@@ -335,6 +362,9 @@ impl TaskExecutor {
                 }
             }
         }
+        downloaded_out.extend(std::mem::take(
+            &mut *downloaded.lock().expect("下载记录锁不应被污染"),
+        ));
         if !blocked.is_empty() {
             if origin_target.is_none() {
                 bail!(
@@ -357,8 +387,9 @@ impl TaskExecutor {
             retry.sort_unstable();
             retry.dedup();
             let stats = fetch::fetch_chunks(&direct_ep, &target, game_id, &retry, |hash, data| {
+                let mut sink = sink_shared.lock().expect("下载写入闭包锁不应被污染");
                 sink(hash, data)?;
-                downloaded.push(hash);
+                downloaded_out.push(hash);
                 Ok(())
             })
             .await?;
@@ -367,15 +398,15 @@ impl TaskExecutor {
                 bail!("仍有 {} 块下载失败", stats.failed.len());
             }
         }
-        Ok(downloaded)
+        Ok(downloaded_out)
     }
 
     fn choose_ep<'a>(
         target: &PeerTarget,
-        direct: &'a iroh::Endpoint,
+        direct: &'a Arc<iroh::Endpoint>,
     ) -> Result<&'a iroh::Endpoint> {
         if target.addr.is_some() {
-            Ok(direct)
+            Ok(&**direct)
         } else {
             bail!("源无直连地址，无法传输数据（relay 只打洞不传数据）")
         }
@@ -1450,7 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_choose_ep_direct_relay_and_missing() {
-        let direct = fetch::build_endpoint(None).await.unwrap();
+        let direct = Arc::new(fetch::build_endpoint(None).await.unwrap());
         let with_addr = PeerTarget {
             endpoint_id: direct.id(),
             addr: Some("127.0.0.1:1".parse().unwrap()),
@@ -1459,7 +1490,7 @@ mod tests {
         };
         assert!(std::ptr::eq(
             TaskExecutor::choose_ep(&with_addr, &direct).unwrap(),
-            &direct
+            &*direct
         ));
         let no_addr = PeerTarget {
             endpoint_id: direct.id(),

@@ -5,7 +5,6 @@ use blaze_common::manifest::HASH_LEN;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -385,18 +384,20 @@ impl GameStore {
 
         live_locations.sort();
         let tmp_path = self.pack_path.with_extension("pack.compact");
-        let mut out = File::create(&tmp_path).context("创建压缩临时文件失败")?;
         let mut new_locations = Vec::new();
         let mut new_offset = 0u64;
-        for (hash, offset, len) in &live_locations {
-            let mut buf = vec![0u8; *len as usize];
-            read_exact_at(&self.pack_file, &mut buf, *offset).context("读取块数据失败")?;
-            out.write_all(&buf).context("写入压缩文件失败")?;
+        for (hash, _, len) in &live_locations {
             new_locations.push((*hash, new_offset, *len));
             new_offset += u64::from(*len);
         }
-        out.sync_all().context("同步压缩文件失败")?;
-        drop(out);
+        // 三期 P3.2b：压缩重写走 compio（io_uring）顺序大块 IO。
+        let ranges: Vec<(u64, u32)> = live_locations
+            .iter()
+            .map(|(_, offset, len)| (*offset, *len))
+            .collect();
+        let copied = blaze_common::compio_io::copy_ranges(&self.pack_path, &tmp_path, &ranges)
+            .context("compio 重写块文件失败")?;
+        Self::ensure_copy_size(copied, live_bytes)?;
 
         std::fs::rename(&tmp_path, &self.pack_path).context("替换块文件失败")?;
         self.pack_file = File::options()
@@ -421,6 +422,14 @@ impl GameStore {
         }
         write_txn.commit().context("提交压缩事务失败")?;
         Ok(true)
+    }
+
+    /// 校验压缩重写字节数与存活字节数一致。
+    fn ensure_copy_size(copied: u64, expected: u64) -> Result<()> {
+        if copied != expected {
+            anyhow::bail!("压缩重写字节数不一致: 预期 {expected}，实际 {copied}");
+        }
+        Ok(())
     }
 
     /// 当前 pack 文件大小（字节）。
@@ -526,6 +535,13 @@ mod tests {
     fn test_write_exact_at_zero_write() {
         let err = write_exact_at_impl(|_, _| Ok(0), b"x", 0).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn test_ensure_copy_size_mismatch() {
+        let err = GameStore::ensure_copy_size(1, 2).unwrap_err();
+        assert!(err.to_string().contains("字节数不一致"));
+        GameStore::ensure_copy_size(2, 2).unwrap();
     }
 
     #[test]

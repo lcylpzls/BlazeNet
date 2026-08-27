@@ -1,4 +1,5 @@
 //! BlazeNet 公共库：协议类型、配置、错误码等共享内容。
+pub mod compio_io;
 pub mod keepalive;
 pub mod manifest;
 pub mod update_plan;
