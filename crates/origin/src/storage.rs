@@ -3,9 +3,9 @@
 use anyhow::{Context, Result};
 use blaze_common::manifest::HASH_LEN;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -29,6 +29,76 @@ fn unpack(value: u64) -> (u64, u32) {
 
 fn pack(offset: u64, len: u32) -> u64 {
     (offset << 32) | u64::from(len)
+}
+
+/// 按偏移读取（Linux 用 `pread` 单次系统调用；其余平台回退 seek+read）。
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read(buf)
+}
+
+/// 按偏移写入（Linux 用 `pwrite` 单次系统调用；其余平台回退 seek+write）。
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.write(buf)
+}
+
+/// 按偏移精确读满缓冲区（处理短读与 EOF）。
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        let n = read_at(file, buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "读取块数据遇到文件末尾",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// 按偏移写满缓冲区（处理短写）；写入函数可注入，便于测试 0 长度分支。
+fn write_exact_at_impl<F>(mut write: F, mut buf: &[u8], mut offset: u64) -> std::io::Result<()>
+where
+    F: FnMut(&[u8], u64) -> std::io::Result<usize>,
+{
+    while !buf.is_empty() {
+        let n = write(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "写入失败",
+            ));
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+/// 按偏移写满缓冲区（Linux 用 `pwrite` 单次系统调用；其余平台回退 seek+write）。
+fn write_exact_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    write_exact_at_impl(|b, o| write_at(file, b, o), buf, offset)
 }
 
 /// 块数据源抽象：IDC/原始节点用 pack 块库，网吧用临时块 + 真实文件偏移读。
@@ -155,12 +225,9 @@ impl GameStore {
         }
         drop(read_txn);
 
-        self.pack_file
-            .seek(SeekFrom::End(0))
-            .context("定位块文件末尾失败")?;
-        self.pack_file.write_all(data).context("追加写入块失败")?;
         let offset = self.size;
         let len = data.len() as u32;
+        write_exact_at(&self.pack_file, data, offset).context("追加写入块失败")?;
         self.size += data.len() as u64;
 
         let write_txn = self.db.begin_write().context("开始写事务失败")?;
@@ -172,6 +239,66 @@ impl GameStore {
         }
         write_txn.commit().context("提交索引事务失败")?;
         Ok((offset, len))
+    }
+
+    /// 批量追加块：一次只读事务查重 + 一次连续写入 + 一次索引提交（减少事务与 fsync 放大）。
+    /// 返回与输入一一对应的 (偏移, 长度)；已存在的块直接复用旧位置。
+    pub fn append_chunks_batch(
+        &mut self,
+        chunks: &[([u8; HASH_LEN], Vec<u8>)],
+    ) -> Result<Vec<(u64, u32)>> {
+        let mut out = Vec::with_capacity(chunks.len());
+        let mut new_data: Vec<(&[u8; HASH_LEN], &[u8])> = Vec::new();
+        let mut new_pos: Vec<usize> = Vec::new();
+        let mut seen_new: HashMap<[u8; HASH_LEN], usize> = HashMap::new();
+        let mut dup_of_new: Vec<(usize, usize)> = Vec::new();
+        {
+            let read_txn = self.db.begin_read().context("开始只读事务失败")?;
+            let table = read_txn.open_table(TABLE).context("打开索引表失败")?;
+            for (idx, (hash, data)) in chunks.iter().enumerate() {
+                if let Some(first) = seen_new.get(hash) {
+                    dup_of_new.push((idx, *first));
+                    out.push((0, 0));
+                    continue;
+                }
+                if let Some(value) = table
+                    .get(&key(self.game_id, hash))
+                    .context("查询索引失败")?
+                {
+                    out.push(unpack(value.value()));
+                } else {
+                    seen_new.insert(*hash, idx);
+                    out.push((0, 0));
+                    new_data.push((hash, data));
+                    new_pos.push(idx);
+                }
+            }
+        }
+        let mut offset = self.size;
+        for (idx, (_, data)) in new_data.iter().enumerate() {
+            write_exact_at(&self.pack_file, data, offset).context("批量追加写入块失败")?;
+            let len = data.len() as u32;
+            out[new_pos[idx]] = (offset, len);
+            offset += u64::from(len);
+        }
+        for (idx, first) in dup_of_new {
+            out[idx] = out[first];
+        }
+        self.size = offset;
+        if !new_data.is_empty() {
+            let write_txn = self.db.begin_write().context("开始写事务失败")?;
+            {
+                let mut table = write_txn.open_table(TABLE).context("打开索引表失败")?;
+                for ((hash, _), idx) in new_data.iter().zip(&new_pos) {
+                    let (offset, len) = out[*idx];
+                    table
+                        .insert(&key(self.game_id, hash), pack(offset, len))
+                        .context("写入索引失败")?;
+                }
+            }
+            write_txn.commit().context("提交索引事务失败")?;
+        }
+        Ok(out)
     }
 
     /// 按哈希读取块数据；不存在返回 `None`。
@@ -187,10 +314,7 @@ impl GameStore {
         let (offset, len) = unpack(value.value());
         drop(read_txn);
         let mut buf = vec![0u8; len as usize];
-        let mut file = File::open(&self.pack_path).context("打开块文件失败")?;
-        file.seek(SeekFrom::Start(offset))
-            .context("定位块偏移失败")?;
-        file.read_exact(&mut buf).context("读取块数据失败")?;
+        read_exact_at(&self.pack_file, &mut buf, offset).context("读取块数据失败")?;
         Ok(Some(buf))
     }
 
@@ -266,12 +390,7 @@ impl GameStore {
         let mut new_offset = 0u64;
         for (hash, offset, len) in &live_locations {
             let mut buf = vec![0u8; *len as usize];
-            self.pack_file
-                .seek(SeekFrom::Start(*offset))
-                .context("定位块偏移失败")?;
-            self.pack_file
-                .read_exact(&mut buf)
-                .context("读取块数据失败")?;
+            read_exact_at(&self.pack_file, &mut buf, *offset).context("读取块数据失败")?;
             out.write_all(&buf).context("写入压缩文件失败")?;
             new_locations.push((*hash, new_offset, *len));
             new_offset += u64::from(*len);
@@ -336,6 +455,77 @@ mod tests {
         assert_eq!(s.read_chunk(&hash(8)).unwrap(), None);
         assert_eq!(s.size(), 5);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batch_append_dedupe_and_read() {
+        let dir = std::env::temp_dir().join("blaze-store-batch");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h1 = hash(1);
+        let h2 = hash(2);
+        let chunks = vec![
+            (h1, b"aaaa".to_vec()),
+            (h2, b"bb".to_vec()),
+            (h1, b"aaaa".to_vec()),
+        ];
+        let locs = s.append_chunks_batch(&chunks).unwrap();
+        assert_eq!(locs[0], locs[2]);
+        assert_eq!(locs[0].1, 4);
+        assert_eq!(locs[1].1, 2);
+        assert_eq!(s.read_chunk(&h1).unwrap(), Some(b"aaaa".to_vec()));
+        assert_eq!(s.read_chunk(&h2).unwrap(), Some(b"bb".to_vec()));
+        assert_eq!(s.size(), 6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batch_append_empty() {
+        let dir = std::env::temp_dir().join("blaze-store-batch-empty");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        assert!(s.append_chunks_batch(&[]).unwrap().is_empty());
+        assert_eq!(s.size(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_batch_append_existing_from_db() {
+        let dir = std::env::temp_dir().join("blaze-store-batch-existing");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h1 = hash(1);
+        let h2 = hash(2);
+        s.append_chunk(&h1, b"aaaa").unwrap();
+        let locs = s
+            .append_chunks_batch(&[(h1, b"aaaa".to_vec()), (h2, b"bb".to_vec())])
+            .unwrap();
+        assert_eq!(locs[0], (0, 4));
+        assert_eq!(locs[1].1, 2);
+        assert_eq!(s.size(), 6);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_chunk_eof_after_truncate() {
+        let dir = std::env::temp_dir().join("blaze-store-eof");
+        let _ = fs::remove_dir_all(&dir);
+        let mut s = store(&dir, 1);
+        let h = hash(3);
+        s.append_chunk(&h, b"hello").unwrap();
+        // 截断 pack，使索引偏移越过文件末尾 → 读取返回 EOF 错误。
+        let pack = dir.join("1/blocks.pack");
+        let file = fs::OpenOptions::new().write(true).open(&pack).unwrap();
+        file.set_len(2).unwrap();
+        let err = s.read_chunk(&h).unwrap_err();
+        assert!(err.to_string().contains("读取块数据失败"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_exact_at_zero_write() {
+        let err = write_exact_at_impl(|_, _| Ok(0), b"x", 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
     }
 
     #[test]

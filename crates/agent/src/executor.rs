@@ -16,6 +16,11 @@ use crate::control;
 use crate::fetch::{self, PeerTarget};
 use crate::update;
 
+/// IDC 下载批量落盘阈值：攒满该数量的块后一次写入 pack + 一次 redb 提交。
+const IDC_BATCH_SIZE: usize = 64;
+/// IDC 下载待落盘批次类型。
+type PendingBatch = Vec<([u8; 32], Vec<u8>)>;
+
 /// 任务执行器：按节点类型（IDC/网吧）执行完整同步链路。
 #[derive(Clone)]
 pub struct TaskExecutor {
@@ -119,12 +124,27 @@ impl TaskExecutor {
             .iter()
             .filter_map(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
             .collect();
-        self.download_missing(client, game_id, missing, &assigned, |hash, data| {
+        let pending: Arc<StdMutex<PendingBatch>> = Arc::new(StdMutex::new(Vec::new()));
+        let flush_pending = |pending: &Arc<StdMutex<PendingBatch>>| -> Result<()> {
+            let batch = std::mem::take(&mut *pending.lock().expect("块库缓冲锁不应被污染"));
+            if batch.is_empty() {
+                return Ok(());
+            }
             let mut guard = store.lock().expect("块库锁不应被污染");
-            guard.append_chunk(&hash, &data)?;
+            guard.append_chunks_batch(&batch)?;
+            Ok(())
+        };
+        self.download_missing(client, game_id, missing, &assigned, |hash, data| {
+            let mut batch = pending.lock().expect("块库缓冲锁不应被污染");
+            batch.push((hash, data));
+            if batch.len() >= IDC_BATCH_SIZE {
+                drop(batch);
+                flush_pending(&pending)?;
+            }
             Ok(())
         })
         .await?;
+        flush_pending(&pending)?;
         let mut held: Vec<[u8; 32]> = index.chunk_set().into_iter().collect();
         held.sort();
         self.report_chunks(client, game_id, &held).await?;
@@ -664,6 +684,101 @@ mod tests {
         assert_eq!(tasks[0].status, "done");
         assert!(store.chunk_holders(1, &hashes[0]).unwrap().contains(&1));
         assert!(store.chunk_holders(1, &hashes[1]).unwrap().contains(&1));
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_idc_batch_flush() {
+        let dir = std::env::temp_dir().join("blaze-exec-batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_dir = dir.join("seed");
+        let idc_dir = dir.join("idc");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&idc_dir).unwrap();
+        let contents: Vec<Vec<u8>> = (0u8..65).map(|i| vec![i]).collect();
+        let hashes: Vec<[u8; 32]> = contents.iter().map(|c| hash_of(c)).collect();
+        // 种子库：65 个单字节块（超过批量阈值 64，触发中途落盘分支）。
+        let mut seed = GameStore::open(&seed_dir, 1).unwrap();
+        let chunks: Vec<([u8; 32], Vec<u8>)> = hashes
+            .iter()
+            .zip(&contents)
+            .map(|(h, c)| (*h, c.clone()))
+            .collect();
+        seed.append_chunks_batch(&chunks).unwrap();
+        let pack = Arc::new(StdMutex::new(seed));
+        let pack_stores: Arc<Mutex<HashMap<u64, Arc<StdMutex<GameStore>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        pack_stores.lock().await.insert(1, pack.clone());
+        let data_stores: Arc<Mutex<HashMap<u64, NodeStore>>> = Arc::new(Mutex::new(HashMap::new()));
+        data_stores.lock().await.insert(1, NodeStore::Pack(pack));
+        let handle = datapath::serve(data_stores, pack_stores, seed_dir, 0, None, None, true)
+            .await
+            .unwrap();
+        let entries: Vec<FileEntry> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| FileEntry {
+                name: format!("f{i:02}.bin"),
+                file_hash: *h,
+                chunks: vec![ChunkMeta { hash: *h, len: 1 }],
+            })
+            .collect();
+        let bytes = GameIndex::build(entries).encode().unwrap();
+        let (url, service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "seed".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        for hash in &hashes {
+            store.record_chunk_holder(2, 1, hash).unwrap();
+        }
+        service
+            .push_task(TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+        let cfg = config(
+            NodeType::Idc,
+            idc_dir.clone(),
+            url,
+            Some(handle.endpoint_id().to_string()),
+            Some(format!("127.0.0.1:{}", handle.port())),
+        );
+        let (exec, _data, local_stores, _cafe) = executor(cfg, 1);
+        exec.run_task(assigned_task(1, 1, 1, &hashes))
+            .await
+            .unwrap();
+        let local = local_stores.lock().await.get(&1).unwrap().clone();
+        {
+            let guard = local.lock().unwrap();
+            for hash in &hashes {
+                assert!(guard.contains(hash).unwrap());
+            }
+            assert_eq!(guard.size(), 65);
+        }
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&dir);

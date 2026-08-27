@@ -64,12 +64,32 @@ pub fn plan_update(
     Ok(update_plan::compute(&new, old.as_ref(), &temp))
 }
 
-fn read_chunk_at(file: &Path, offset: u64, len: u32) -> Result<Vec<u8>> {
+/// 按偏移读取（Linux 用 `pread` 单次系统调用；其余平台回退 seek+read）。
+#[cfg(unix)]
+fn read_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_at(file: &fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(file).context("打开文件失败")?;
-    f.seek(SeekFrom::Start(offset)).context("定位失败")?;
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(offset))?;
+    cloned.read(buf)
+}
+
+/// 从已打开文件按偏移读取块数据（网吧合并复用句柄，避免每块重新打开）。
+fn read_chunk_at(file: &fs::File, offset: u64, len: u32) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len as usize];
-    f.read_exact(&mut buf).context("读取块失败")?;
+    let mut read = 0usize;
+    while read < len as usize {
+        let n = read_at(file, &mut buf[read..], offset + read as u64).context("读取块失败")?;
+        if n == 0 {
+            anyhow::bail!("读取块遇到文件末尾");
+        }
+        read += n;
+    }
     Ok(buf)
 }
 
@@ -88,16 +108,29 @@ fn write_new_file(
     // 流式拼装：逐块写入临时文件并增量哈希，避免整文件载入内存。
     let mut out = fs::File::create(&new_path).context("创建临时文件失败")?;
     let mut hasher = blake3::Hasher::new();
+    let old_handle = old_file
+        .filter(|p| p.is_file())
+        .map(fs::File::open)
+        .transpose()
+        .context("打开旧文件失败")?;
+    let mut last_global: Option<(PathBuf, fs::File)> = None;
     for chunk in &entry.chunks {
-        let data = if let (Some(old_file), Some(map)) = (old_file, old_chunks)
-            && old_file.is_file()
+        let data = if let (Some(old_handle), Some(map)) = (old_handle.as_ref(), old_chunks)
             && let Some((offset, len)) = map.get(&chunk.hash)
         {
-            read_chunk_at(old_file, *offset, *len)?
+            read_chunk_at(old_handle, *offset, *len)?
         } else if let Some((rel, offset, len)) = global_chunks.and_then(|m| m.get(&chunk.hash)) {
             let path = game_dir.join(rel);
             if path.is_file() {
-                read_chunk_at(&path, *offset, *len)?
+                let handle = match last_global.as_mut() {
+                    Some((last_path, file)) if *last_path == path => &*file,
+                    _ => {
+                        let file = fs::File::open(&path).context("打开复用源文件失败")?;
+                        last_global = Some((path.clone(), file));
+                        &last_global.as_ref().expect("刚写入的句柄").1
+                    }
+                };
+                read_chunk_at(handle, *offset, *len)?
             } else {
                 fs::read(temp_dir.join(format!("{}.blk", hex(&chunk.hash))))
                     .context("读取临时块失败")?
@@ -408,6 +441,62 @@ mod tests {
         assert_eq!(summary.deleted, 1);
         assert_eq!(fs::read(game_dir.join("b.bin")).unwrap(), data);
         assert!(!game_dir.join("a.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_reuses_same_source_handle() {
+        let dir = std::env::temp_dir().join("blaze-upd-same-src");
+        let _ = fs::remove_dir_all(&dir);
+        let game_dir = dir.join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+        let temp_dir = dir.join("temp");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let data = b"hello".to_vec();
+        fs::write(game_dir.join("a.bin"), &data).unwrap();
+        let file = |name: &str| FileEntry {
+            name: name.to_string(),
+            file_hash: hash_of(&data),
+            chunks: vec![
+                ChunkMeta {
+                    hash: [1u8; 32],
+                    len: 2,
+                },
+                ChunkMeta {
+                    hash: [2u8; 32],
+                    len: 3,
+                },
+            ],
+        };
+        let old = index(vec![file("a.bin")]);
+        let new = index(vec![file("b.bin")]);
+        fs::write(game_dir.join("a.bin"), &data).unwrap();
+        let summary = merge_files(&game_dir, &new, Some(&old), &temp_dir).unwrap();
+        assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+        assert_eq!(summary.merged, 1);
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(fs::read(game_dir.join("b.bin")).unwrap(), data);
+        assert!(!game_dir.join("a.bin").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_merge_reads_past_eof_fails() {
+        let dir = std::env::temp_dir().join("blaze-upd-eof");
+        let _ = fs::remove_dir_all(&dir);
+        let game_dir = dir.join("game");
+        fs::create_dir_all(&game_dir).unwrap();
+        let temp_dir = dir.join("temp");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let old_a = b"hello".to_vec();
+        fs::write(game_dir.join("a.bin"), &old_a).unwrap();
+        // 旧清单声明块长度超过真实文件大小 → 合并按偏移读触发 EOF。
+        let old = index(vec![entry("a.bin", [9; 32], vec![(1, 10), (2, 3)])]);
+        let new = index(vec![entry("a.bin", [8; 32], vec![(1, 10), (2, 3)])]);
+        let summary = merge_files(&game_dir, &new, Some(&old), &temp_dir).unwrap();
+        assert_eq!(summary.failed.len(), 1);
+        assert!(summary.failed[0].contains("读取块遇到文件末尾"));
+        assert_eq!(fs::read(game_dir.join("a.bin")).unwrap(), old_a);
         let _ = fs::remove_dir_all(&dir);
     }
 }
