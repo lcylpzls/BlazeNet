@@ -54,6 +54,7 @@ pub async fn run(config: Config, stop: impl Future<Output = ()>) -> Result<()> {
         keepalive_socket,
         config.keepalive_interval_secs,
         config.keepalive_fail_threshold,
+        config.offline_timeout_secs * 1000,
         keepalive_rx,
     ));
 

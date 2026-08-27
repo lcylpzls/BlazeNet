@@ -113,7 +113,7 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
     }
     if let Some(addr) = &config.control_addr {
         let mut client = control::connect(addr).await?;
-        let addrs = external_addr
+        let mut addrs: Vec<blaze_proto::control::Addr> = external_addr
             .map(|addr| blaze_proto::control::Addr {
                 addr: addr.to_string(),
                 kind: if config.external_addr.is_some() {
@@ -126,6 +126,16 @@ pub async fn start(config: config::Config) -> Result<AgentHandle> {
             })
             .into_iter()
             .collect();
+        // 配置保活端口且存在外部地址时，额外上报保活探测地址（调度中心只探测该地址）。
+        if let (Some(addr), Some(port)) = (&config.external_addr, config.keepalive_port)
+            && let Ok(socket) = addr.parse::<std::net::SocketAddr>()
+        {
+            addrs.push(blaze_proto::control::Addr {
+                addr: format!("{}:{port}", socket.ip()),
+                kind: "keepalive".to_string(),
+                link: String::new(),
+            });
+        }
         let reply = control::register(
             &mut client,
             &config.node_type.to_string(),
@@ -275,6 +285,48 @@ mod tests {
         .await
         .unwrap();
         assert!(handle.port() > 0);
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_reports_keepalive_addr() {
+        let dir = std::env::temp_dir().join("blaze-agent-keepalive");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        seed(&dir, 1, 2).unwrap();
+        let (url, _service, _handle, store) = scheduler_setup().await;
+        let handle = start(config::Config {
+            node_type: config::NodeType::Idc,
+            data_dir: dir.clone(),
+            concurrent_games: 2,
+            chunk_concurrency: 2,
+            disk_free_threshold: 1024,
+            compact_threshold: 0.3,
+            listen_port: 0,
+            temp_ttl_hours: 24,
+            download_mbps: None,
+            origin_endpoint: None,
+            origin_addr: None,
+            keepalive_port: Some(42002),
+            relay_url: None,
+            external_addr: Some("127.0.0.1:42001".to_string()),
+            stun_addr: None,
+            control_addr: Some(url),
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let nodes = store.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        let keepalive: Vec<String> = nodes[0]
+            .addrs
+            .iter()
+            .filter(|a| a.kind == "keepalive")
+            .map(|a| a.addr.clone())
+            .collect();
+        assert_eq!(keepalive, vec!["127.0.0.1:42002".to_string()]);
         handle.shutdown();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let _ = fs::remove_dir_all(&dir);

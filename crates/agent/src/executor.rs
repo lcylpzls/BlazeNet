@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use blaze_common::manifest::GameIndex;
 use blaze_common::update_plan;
-use blaze_proto::control::{ChunkDone, PeerQuery, Task};
+use blaze_proto::control::{ChunkDone, Peer, PeerQuery, Task};
 use origin::storage::{GameStore, NodeStore};
 use tokio::sync::{Mutex, Semaphore};
 
@@ -244,23 +244,59 @@ impl TaskExecutor {
         if missing.is_empty() {
             return Ok(Vec::new());
         }
-        let mut groups: Vec<(PeerTarget, Vec<[u8; 32]>)> = Vec::new();
-        let mut group_index: HashMap<String, usize> = HashMap::new();
-        let mut fallback: Vec<[u8; 32]> = Vec::new();
-        for hash in &missing {
-            let peers = client
-                .query_peers(PeerQuery {
-                    game_id,
-                    chunk_hash: hash.to_vec(),
-                    limit: 5,
-                })
-                .await?
-                .into_inner()
-                .peers;
-            if let Some(peer) = peers.into_iter().find(|p| !p.addrs.is_empty()) {
-                // 多 IP 分流：按块哈希轮询地址，同一节点的多个公网地址可并行。
-                let idx = hash[0] as usize % peer.addrs.len();
-                let addr = peer.addrs[idx].addr.parse().ok();
+        let origin_target = match (&self.config.origin_endpoint, &self.config.origin_addr) {
+            (Some(endpoint), Some(addr)) => Some(PeerTarget {
+                endpoint_id: endpoint.parse().context("原始节点端点 ID 非法")?,
+                addr: Some(addr.parse().context("原始节点地址非法")?),
+                relay_url: self.config.relay_url.clone(),
+                direct_only: false,
+            }),
+            _ => None,
+        };
+        // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
+        let direct_ep = Arc::new(fetch::build_endpoint(None).await?);
+        let rate = self.config.download_mbps;
+        let started = Instant::now();
+        let mut total_bytes = 0u64;
+        let mut downloaded_out = Vec::new();
+        let downloaded: Arc<StdMutex<Vec<[u8; 32]>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink_shared = Arc::new(StdMutex::new(sink));
+        let mut retry = Vec::new();
+        let mut blocked = Vec::new();
+        // 三期 P3.3 多源并发：每轮按块哈希把缺失块轮询分布到所有可用 peer 并行拉取；
+        // 失败 peer 记录后下一轮剩余块切换其他 peer（跨节点分块 + 故障切换）。
+        let mut unresolved: Vec<[u8; 32]> = missing;
+        let mut exclude: HashSet<String> = HashSet::new();
+        for _round in 0..2 {
+            if unresolved.is_empty() {
+                break;
+            }
+            let mut groups: Vec<(PeerTarget, Vec<[u8; 32]>)> = Vec::new();
+            let mut group_index: HashMap<String, usize> = HashMap::new();
+            let mut next_unresolved: Vec<[u8; 32]> = Vec::new();
+            for hash in unresolved {
+                let peers = client
+                    .query_peers(PeerQuery {
+                        game_id,
+                        chunk_hash: hash.to_vec(),
+                        limit: 5,
+                    })
+                    .await?
+                    .into_inner()
+                    .peers;
+                let candidates: Vec<&Peer> = peers
+                    .iter()
+                    .filter(|p| !p.addrs.is_empty() && !exclude.contains(&p.endpoint_id))
+                    .filter(|p| p.endpoint_id.parse::<iroh::EndpointId>().is_ok())
+                    .collect();
+                if candidates.is_empty() {
+                    next_unresolved.push(hash);
+                    continue;
+                }
+                // 跨 peer 轮询：块哈希散列到多个候选源；同一 peer 多地址再按哈希轮询。
+                let peer = candidates[hash[0] as usize % candidates.len()];
+                let addr_idx = hash[0] as usize % peer.addrs.len();
+                let addr = peer.addrs[addr_idx].addr.parse().ok();
                 let target = PeerTarget {
                     endpoint_id: peer.endpoint_id.parse().context("候选端点 ID 非法")?,
                     addr,
@@ -282,89 +318,61 @@ impl TaskExecutor {
                         idx
                     }
                 };
-                groups[idx].1.push(*hash);
-            } else {
-                fallback.push(*hash);
+                groups[idx].1.push(hash);
             }
+            if groups.is_empty() {
+                unresolved = next_unresolved;
+                break;
+            }
+            let mut tasks = tokio::task::JoinSet::new();
+            for (target, hashes) in groups {
+                let _permit = self.source_permits.acquire().await;
+                let ep = Self::choose_ep(&target, &direct_ep)?;
+                let ep = ep.clone();
+                let target_key = target.endpoint_id.to_string();
+                let sink_shared = sink_shared.clone();
+                let downloaded = downloaded.clone();
+                tasks.spawn(async move {
+                    let result = fetch::fetch_chunks(&ep, &target, game_id, &hashes, {
+                        let sink_shared = sink_shared.clone();
+                        let downloaded = downloaded.clone();
+                        move |hash, data| {
+                            let mut sink = sink_shared.lock().expect("下载写入闭包锁不应被污染");
+                            sink(hash, data)?;
+                            downloaded.lock().expect("下载记录锁不应被污染").push(hash);
+                            Ok(())
+                        }
+                    })
+                    .await;
+                    (target_key, hashes, result)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let (target_key, hashes, result) = joined.context("并发下载任务异常")?;
+                match result {
+                    Ok(stats) => {
+                        Self::throttle(rate, &mut total_bytes, stats.bytes, started).await;
+                        next_unresolved.extend(stats.failed);
+                    }
+                    Err(err) => {
+                        println!("候选源连接失败，下轮切换其他源: {err:#}");
+                        exclude.insert(target_key);
+                        next_unresolved.extend(hashes);
+                    }
+                }
+            }
+            unresolved = next_unresolved;
         }
-        let origin_target = match (&self.config.origin_endpoint, &self.config.origin_addr) {
-            (Some(endpoint), Some(addr)) => Some(PeerTarget {
-                endpoint_id: endpoint.parse().context("原始节点端点 ID 非法")?,
-                addr: Some(addr.parse().context("原始节点地址非法")?),
-                relay_url: self.config.relay_url.clone(),
-                direct_only: false,
-            }),
-            _ => None,
-        };
-        // 数据面只用直连端点：relay 只打洞不传数据，且 iroh 配置 relay 会阻塞公网直连。
-        let direct_ep = Arc::new(fetch::build_endpoint(None).await?);
-        let rate = self.config.download_mbps;
-        let started = Instant::now();
-        let mut total_bytes = 0u64;
-        let mut downloaded_out = Vec::new();
-        let downloaded: Arc<StdMutex<Vec<[u8; 32]>>> = Arc::new(StdMutex::new(Vec::new()));
-        let sink_shared = Arc::new(StdMutex::new(sink));
-        let mut retry = Vec::new();
-        let mut blocked = Vec::new();
-        for hash in fallback {
+        downloaded_out.extend(std::mem::take(
+            &mut *downloaded.lock().expect("下载记录锁不应被污染"),
+        ));
+        for hash in unresolved {
             if assigned.contains(&hash) {
                 retry.push(hash);
             } else {
                 blocked.push(hash);
             }
         }
-        // 三期 P3.3：多源并发拉取——不同候选源/地址组并行下载，受 source_permits 限制；
-        // 落盘仍由调用方 sink 串行执行，保证块库写入有序。
-        let mut tasks = tokio::task::JoinSet::new();
-        for (target, hashes) in groups {
-            let _permit = self.source_permits.acquire().await;
-            let ep = Self::choose_ep(&target, &direct_ep)?;
-            let ep = ep.clone();
-            let sink_shared = sink_shared.clone();
-            let downloaded = downloaded.clone();
-            tasks.spawn(async move {
-                let result = fetch::fetch_chunks(&ep, &target, game_id, &hashes, {
-                    let sink_shared = sink_shared.clone();
-                    let downloaded = downloaded.clone();
-                    move |hash, data| {
-                        let mut sink = sink_shared.lock().expect("下载写入闭包锁不应被污染");
-                        sink(hash, data)?;
-                        downloaded.lock().expect("下载记录锁不应被污染").push(hash);
-                        Ok(())
-                    }
-                })
-                .await;
-                (hashes, result)
-            });
-        }
-        while let Some(joined) = tasks.join_next().await {
-            let (hashes, result) = joined.context("并发下载任务异常")?;
-            match result {
-                Ok(stats) => {
-                    Self::throttle(rate, &mut total_bytes, stats.bytes, started).await;
-                    for hash in stats.failed {
-                        if assigned.contains(&hash) {
-                            retry.push(hash);
-                        } else {
-                            blocked.push(hash);
-                        }
-                    }
-                }
-                Err(err) => {
-                    println!("候选源连接失败，转入原始节点重试: {err:#}");
-                    for hash in hashes {
-                        if assigned.contains(&hash) {
-                            retry.push(hash);
-                        } else {
-                            blocked.push(hash);
-                        }
-                    }
-                }
-            }
-        }
-        downloaded_out.extend(std::mem::take(
-            &mut *downloaded.lock().expect("下载记录锁不应被污染"),
-        ));
         if !blocked.is_empty() {
             if origin_target.is_none() {
                 bail!(
@@ -920,6 +928,84 @@ mod tests {
         assert_eq!(
             std::fs::read(cafe_dir.join("games/1/dir/a.bin")).unwrap(),
             b"hello"
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cafe_peer_failover_switches_source() {
+        let dir = std::env::temp_dir().join("blaze-exec-failover");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed_dir = dir.join("seed");
+        let cafe_dir = dir.join("cafe");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::create_dir_all(&cafe_dir).unwrap();
+        let (handle, hashes) = seed_server(&seed_dir, 1).await;
+        let bytes = manifest(&[("dir/a.bin", b"hello"), ("dir/b.bin", b"world")]);
+        let (url, service, _srv, store) = scheduler_setup(&dir.join("sched")).await;
+        store.save_version(1, 1, &bytes).unwrap();
+        // 不可达 peer（占位）与可达 peer（seed）同时持有全部块：
+        // 网吧应跨 peer 切换，最终全部从可达 seed 拉取。
+        store
+            .insert_node(&NodeRecord {
+                id: 2,
+                node_type: "idc".to_string(),
+                endpoint_id: format!("{:064x}", 7u64),
+                token: "bad".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: "127.0.0.1:1".to_string(),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        store
+            .insert_node(&NodeRecord {
+                id: 3,
+                node_type: "idc".to_string(),
+                endpoint_id: handle.endpoint_id().to_string(),
+                token: "peer".to_string(),
+                addrs: vec![AddrRecord {
+                    addr: format!("127.0.0.1:{}", handle.port()),
+                    kind: "config".to_string(),
+                    link: String::new(),
+                }],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        for hash in &hashes {
+            store.record_chunk_holder(2, 1, hash).unwrap();
+            store.record_chunk_holder(3, 1, hash).unwrap();
+        }
+        service
+            .push_task(TaskRecord {
+                id: 1,
+                node_id: 1,
+                game_id: 1,
+                version: 1,
+                kind: "UPDATE".to_string(),
+                assigned_chunks: vec![],
+                status: "queued".to_string(),
+                error: String::new(),
+            })
+            .await
+            .unwrap();
+        let (exec, _data, _pack, _cafe) =
+            executor(config(NodeType::Cafe, cafe_dir.clone(), url, None, None), 1);
+        exec.run_task(task(1, 1, 1)).await.unwrap();
+        assert_eq!(
+            std::fs::read(cafe_dir.join("games/1/dir/a.bin")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(cafe_dir.join("games/1/dir/b.bin")).unwrap(),
+            b"world"
         );
         tokio::time::sleep(Duration::from_millis(700)).await;
         handle.shutdown();

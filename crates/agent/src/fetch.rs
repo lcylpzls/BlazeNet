@@ -1,6 +1,7 @@
 //! 数据面拉取客户端：批量请求缺失块，逐块校验后交给回调保存。
 use anyhow::{Context, Result};
 use blaze_common::manifest::HASH_LEN;
+use iroh::endpoint::QuicTransportConfig;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use iroh_relay::tls::CaTlsConfig;
@@ -43,12 +44,20 @@ pub async fn build_endpoint(relay_url: Option<&str>) -> Result<Endpoint> {
     let mut builder = Endpoint::builder(presets::Minimal)
         .alpns(vec![ALPN.to_vec()])
         .clear_address_lookup()
-        .clear_ip_transports();
+        .clear_ip_transports()
+        // NAT 内网直连需要地址观测报告，否则对端无法确认公网路径（联调工具同配置）。
+        .transport_config(
+            QuicTransportConfig::builder()
+                .send_observed_address_reports(true)
+                .receive_observed_address_reports(true)
+                .build(),
+        )
+        // 直连与 relay 均信任自签证书：项目 PoC 阶段使用自签证书，
+        // 上线前接入 ACME/受信任 CA 后移除（见 docs/08-部署运维文档）。
+        .ca_tls_config(CaTlsConfig::insecure_skip_verify());
     if let Some(url) = relay_url {
         let relay: iroh::RelayUrl = url.parse().context("relay 地址非法")?;
-        builder = builder
-            .relay_mode(RelayMode::Custom(RelayMap::from_iter([relay])))
-            .ca_tls_config(CaTlsConfig::insecure_skip_verify());
+        builder = builder.relay_mode(RelayMode::Custom(RelayMap::from_iter([relay])));
     } else {
         builder = builder.relay_mode(RelayMode::Disabled);
     }

@@ -99,6 +99,7 @@ pub async fn run(
     socket: Arc<tokio::net::UdpSocket>,
     interval_secs: u64,
     fail_threshold: u32,
+    heartbeat_timeout_ms: u64,
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut keep = Keepalive::new();
@@ -115,12 +116,28 @@ pub async fn run(
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                // 同步节点可入站地址（仅 kind=config 的映射地址，打洞地址不探测）。
+                // 心跳超时离线判定：最近心跳早于 interval*fail_threshold 的节点标离线，
+                // 避免死节点长期作为候选源（keepalive 只覆盖显式上报保活地址的节点）。
+                let timeout_ms = heartbeat_timeout_ms;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let offline = store.offline_nodes(now_ms, timeout_ms).unwrap_or_default();
+                for id in offline {
+                    if let Ok(Some(mut node)) = store.get_node(id)
+                        && node.status != "offline"
+                    {
+                        node.status = "offline".to_string();
+                        let _ = store.insert_node(&node);
+                    }
+                }
+                // 同步节点显式上报的保活地址（kind=keepalive，打洞地址不探测）。
                 let nodes = store.list_nodes().unwrap_or_default();
                 meta.clear();
                 for node in nodes {
                     for (index, addr) in node.addrs.iter().enumerate() {
-                        if addr.kind == "config"
+                        if addr.kind == "keepalive"
                             && let Ok(parsed) = addr.addr.parse()
                         {
                             meta.insert(parsed, (node.id, index as u32));
@@ -300,7 +317,7 @@ mod tests {
             1,
             AddrRecord {
                 addr: target.to_string(),
-                kind: "config".to_string(),
+                kind: "keepalive".to_string(),
                 link: String::new(),
             },
         );
@@ -318,13 +335,13 @@ mod tests {
             3,
             AddrRecord {
                 addr: "不合法".to_string(),
-                kind: "config".to_string(),
+                kind: "keepalive".to_string(),
                 link: String::new(),
             },
         );
         let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(run(store.clone(), socket, 2, 2, rx));
+        let task = tokio::spawn(run(store.clone(), socket, 2, 2, 60_000, rx));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         loop {
             let status = store.get_node(1).unwrap().unwrap().status;
@@ -380,7 +397,7 @@ mod tests {
             1,
             AddrRecord {
                 addr: target.to_string(),
-                kind: "config".to_string(),
+                kind: "keepalive".to_string(),
                 link: String::new(),
             },
         );
@@ -393,7 +410,7 @@ mod tests {
             .await
             .unwrap();
         let (tx, rx) = oneshot::channel();
-        let task = tokio::spawn(run(store.clone(), sched, 2, 2, rx));
+        let task = tokio::spawn(run(store.clone(), sched, 2, 2, 60_000, rx));
         wait_status(&store, "online").await;
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(store.get_node(1).unwrap().unwrap().status, "online");
@@ -404,6 +421,44 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(300)).await;
         responder_task.await.unwrap();
+        tx.send(()).unwrap();
+        task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_run_marks_offline_by_heartbeat_timeout() {
+        let dir = std::env::temp_dir().join("blaze-keep-hb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::open(&dir).unwrap());
+        // 无保活地址、心跳早已超时的节点：应由心跳超时判定离线。
+        store
+            .insert_node(&NodeRecord {
+                id: 1,
+                node_type: "idc".to_string(),
+                endpoint_id: "endpoint-1".to_string(),
+                token: "token".to_string(),
+                addrs: vec![],
+                status: "online".to_string(),
+                last_heartbeat_ms: 1,
+            })
+            .unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(run(store.clone(), socket, 2, 2, 3_000, rx));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let status = store.get_node(1).unwrap().unwrap().status;
+            if status == "offline" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "心跳超时节点未按时离线"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         tx.send(()).unwrap();
         task.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
